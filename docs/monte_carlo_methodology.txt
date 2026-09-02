@@ -1,0 +1,107 @@
+MONTE CARLO SIMULATION METHODOLOGY
+GPU Secondary Market Depreciation Analysis
+March 2026
+
+
+1. INPUTS
+
+The MC takes the outputs of the curve-fitting stage:
+
+  - Fitted model parameters (floor, decay rate k or exponent b)
+  - Parameter covariance matrix, which captures how uncertain each
+    parameter is and how they correlate with each other
+  - Segment-level canonical parameters — a pooled fit across well-observed
+    GPUs in each market segment (datacenter, workstation, consumer)
+  - Current market price ratio for each GPU (latest observed price / MSRP)
+
+For Tier 2 GPUs, the floor parameter is regularised toward a segment-level
+empirical prior before entering the MC. This borrows strength from mature
+GPUs in the same segment to inform the projection for newer ones.
+
+
+2. HOW IT WORKS
+
+  10,000 draws per GPU, validated by comparing against 2,000-draw runs
+  and confirming CI estimates were stable to within 1%.
+
+  The sampling approach follows a three-tier hierarchy based on data
+  availability:
+
+  TIER 1 — Ensemble (individually fitted GPUs):
+    Two candidate models (exponential-with-floor, power-law-with-floor)
+    are blended using Akaike weights from their AICc scores. Per draw:
+      1. Sample parameters from a multivariate normal centred on the
+         fitted values, using the covariance matrix
+      2. Clip to physically plausible bounds
+      3. Evaluate each model at target time points (every 12 months out
+         to 10 years)
+      4. Blend using the Akaike weights
+
+  TIER 2 — Constrained (segment-informed GPUs):
+    The decay rate k is anchored from the segment-level fit during the
+    fitting step; the floor is fitted to the individual GPU's data. In
+    the MC, both floor and k are sampled jointly. Per draw:
+      1. Sample [floor, k] jointly from a 2D normal using the fitted
+         floor value plus the cross-covariance from the segment fit
+         (floor and k are negatively correlated — a faster decay implies
+         a lower floor to match the same data)
+      2. Clip to bounds and evaluate the exponential model
+      3. Scale to the GPU's current market price, with per-draw noise
+         to reflect uncertainty in the current price level
+
+  TIER 3 — Segment Default (segment-driven GPUs):
+    Same joint [floor, k] sampling and stochastic scaling as Tier 2,
+    but parameters come entirely from the segment canonical fit.
+
+  The covariance matrix from curve fitting assumes each data point is
+  independent, but monthly GPU prices are autocorrelated. A Bartlett
+  correction inflates the covariance by (1 + rho) / (1 - rho), where
+  rho is the lag-1 autocorrelation, to account for this.
+
+
+3. OUTPUTS
+
+From the 10,000 x 11 draw matrix (one row per draw, columns at 0, 12,
+24, 36, 48, 60, 72, 84, 96, 108, and 120 months from launch):
+
+  - Point estimate: median of draws at the 60-month (5-year) mark
+  - 95% confidence interval (HPD) at each time point — the narrowest
+    interval containing 95% of draws
+  - Standard deviation at each time point
+  - Tail risk: fraction of draws below 10% of MSRP at the 5yr, 8yr,
+    and 10yr marks
+  - Full depreciation curve: median at each of the 11 time points
+  - Per-time-point HPD bounds and std devs for reconstructing the full
+    uncertainty fan
+
+
+4. VALIDATION
+
+  - Convergence test: compared 2,000 vs 10,000 draws on five GPUs (one
+    per fitting pathway), confirmed stability at 10,000.
+
+  - Temporal holdout: back-tested on four GPUs with long enough history
+    to compare projections to actuals. All four fell within their 95%
+    intervals.
+
+  - Hierarchical Bayesian cross-check: a separate PyMC model produced
+    independent value estimates with 0.948 correlation against the
+    primary pipeline.
+
+  - Sensitivity analysis: varied four key pipeline thresholds across
+    their plausible ranges. Rankings were stable in every scenario
+    (Spearman rho > 0.965).
+
+
+5. WHY THESE CHOICES
+
+  - Parametric MC (sampling parameters) rather than residual bootstrap:
+    we need to project beyond the observed data window, and parametric
+    sampling keeps trajectories physically plausible.
+
+  - Joint [floor, k] sampling for Tier 2/3: these parameters are
+    negatively correlated in the exponential model. Joint sampling
+    preserves that structure and produces well-calibrated uncertainty.
+
+  - HPD intervals rather than equal-tailed: shorter intervals when the
+    distribution is skewed, which it often is near parameter bounds.

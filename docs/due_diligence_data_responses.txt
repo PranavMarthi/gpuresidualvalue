@@ -1,0 +1,448 @@
+DUE DILIGENCE DATA RESPONSES
+Based on Monte Carlo Depreciation Model & Scrap Floor Analysis
+==============================================================
+
+Date: 2026-03-30
+Dataset: 29 datacenter GPU variants across 22 physical boards
+Model: Constrained exponential decay with Monte Carlo simulation (10,000 paths)
+
+
+1. TAIL RISK & BREACH PROBABILITY
+==================================
+
+1a. Implied probability of breaching the 10% floor at Year 5
+-------------------------------------------------------------
+
+PER-GPU BASIS:
+
+The Monte Carlo simulation produces p(below 10% of MSRP at Year 5) for each
+datacenter GPU. Results sorted by risk:
+
+  GPU                              p(below 10%)   Yr5 Central
+  -----------------------------------------------+-----------
+  A40                                  0.00%        63.8%
+  H100 PCIe 80 GB                     0.00%        80.7%
+  A100 PCIe 80 GB                     0.01%        62.2%
+  H100 PCIe 94 GB                     0.01%        75.2%
+  H100 SXM5 94 GB                     0.01%        43.3%
+  L4                                   0.02%        75.8%
+  L40S                                 0.02%        66.3%
+  A10                                  0.03%        67.2%
+  L40                                  0.03%        68.1%
+  A100 PCIe 40 GB                      0.04%        60.4%
+  A30 PCIe                             0.06%        57.1%
+  Radeon Instinct MI210                0.09%        53.2%
+  H200 NVL                             0.11%        39.4%
+  A16 PCIe                             0.14%        58.2%
+  A100X                                0.21%        52.4%
+  H100 SXM5 80 GB                     0.22%        48.6%
+  H200 SXM                            0.24%        47.9%
+  T4                                   0.88%        35.2%
+  A100 SXM4 40 GB                     1.82%        28.8%
+  Gaudi2 HL-225H                       2.02%        23.9%
+  AMD Instinct MI300X                  2.09%        23.7%
+  A100 SXM4 80 GB                     3.32%        27.7%
+  Tesla V100 PCIe 32 GB               4.24%        22.4%
+  H100 SXM5 64 GB                     5.68%        22.2%
+  NVIDIA GH200                        6.94%        18.7%
+  Tesla V100 SXM2 32 GB               8.50%        18.6%
+  Tesla V100 SXM2 16 GB               8.80%        18.1%
+  Tesla V100S PCIe 32 GB              8.84%        19.3%
+  Tesla V100 PCIe 16 GB               8.93%        18.1%
+
+Summary statistics:
+  Mean p(below 10%):    2.18%
+  Median p(below 10%):  0.21%
+  Maximum:              8.93% (V100 PCIe 16GB)
+  Cards with p > 1%:    11 of 29 (38%)
+  Cards with p > 5%:    6 of 29 (21%) -- includes V100-era (4 cards), H100 SXM5 64GB, and GH200
+
+COHORT BASIS:
+
+For a current-generation portfolio (Ampere architecture and newer, 24 GPUs,
+excluding legacy V100-era hardware):
+  Mean p(below 10%):                  1.00%
+  p(at least one card breaches 10%):  21.8%
+  Dollar-weighted p(breach):          1.40%
+
+For an H100/H200 portfolio (7 variants):
+  Mean p(below 10%):                  0.90%
+  p(at least one card breaches 10%):  6.2%
+
+For the full dataset including legacy hardware (all 29 DC GPUs):
+  p(at least one card breaches 10%):  48.1%
+  p(no card breaches 10%):            51.9%
+  Dollar-weighted p(breach):          2.20%
+
+Note: The 48.1% full-dataset figure is driven almost entirely by the V100
+family (5 variants, 4 with ~8-9% breach probability and 1 at 4.2%). These
+are 7-9 year old cards nearing end-of-life. For a modern datacenter
+portfolio (Ampere+), the cohort breach probability drops to 21.8%, and
+the dollar-weighted individual breach probability is 1.40%. For H100/H200
+specifically, cohort breach probability is 6.2%.
+
+FAMILY-LEVEL BREAKDOWN:
+
+  Family                    N   Mean p   Max p    Yr5     Yr10    MC Yr5  E[L]/GPU  p(any)
+  -----------------------------------------------------------------------------------------
+  V100 Family               5   7.86%    8.93%   19.3%    5.6%    5.9%   0.328pp   33.7%
+  A100 Family (incl A100X)  5   1.08%    3.32%   46.3%   23.9%   13.4%   0.019pp    5.3%
+  H100 Family               5   1.18%    5.68%   54.0%   30.0%   15.3%   0.042pp    5.9%
+  H200 Family               2   0.18%    0.24%   43.6%   19.5%   13.4%   0.000pp    0.4%
+  Ampere Inference          4   0.06%    0.14%   61.6%   35.6%   19.5%   0.000pp    0.2%
+  Ada Lovelace (L4/L40/S)   3   0.02%    0.03%   70.1%   44.0%   19.0%   0.000pp    0.1%
+  Non-NVIDIA                3   1.40%    2.09%   33.6%   15.1%   10.4%   0.029pp    4.2%
+  Standalone (T4/GH200)     2   3.91%    6.94%   26.9%   14.3%    9.0%   0.136pp    7.8%
+  -----------------------------------------------------------------------------------------
+  ALL DATACENTER           29   2.18%    8.93%   44.7%   23.6%   13.2%   0.080pp   48.1%
+
+Key observations by family:
+  - V100 Family: highest risk (7.86% mean breach prob, 33.7% family breach).
+    Drives 71% of portfolio expected loss despite being 17% of card count.
+  - Ada Lovelace: lowest risk (0.02% mean, essentially zero E[L]). These
+    newer inference cards retain 70% of MSRP at Year 5.
+  - H100 Family: moderate risk skewed by the 64GB salvage-bin variant
+    (5.68%). Excluding 64GB, H100 family mean p drops to 0.06%.
+  - H200 Family: very low risk (0.18% mean). Newest generation with strong
+    demand and limited secondary supply.
+  - Non-NVIDIA: moderate risk (1.40%), driven by ecosystem uncertainty
+    (AMD ROCm adoption, Intel Gaudi3 transition).
+  - Standalone: T4 (0.88%) is low-risk inference staple; GH200 (6.94%)
+    is high-risk due to niche ARM ecosystem and rapid depreciation.
+
+
+1b. Sensitivity to accelerated depreciation
+--------------------------------------------
+
+If technology replacement cycles are 20% or 40% shorter than modelled
+(equivalent to reading the model's Year 6 or Year 7 projection as the
+"effective Year 5"), the impact is:
+
+  Scenario                    Mean Yr5 Value    Cards Below 10%
+  ----------------------------------------------------------
+  Base case (Year 5)           44.7% of MSRP       0 of 29
+  20% accelerated (eff. Yr6)   37.7% of MSRP       0 of 29
+  40% accelerated (eff. Yr7)   32.6% of MSRP       0 of 29
+
+Even under 40% accelerated depreciation, no card's central projection
+falls below 10% of MSRP at the 5-year horizon. The lowest individual
+card under the 40% stress scenario is V100 SXM2 16GB at 10.4% -- still
+above the 10% floor.
+
+The model's volatility (mean sigma = 19.0% at Year 5) already incorporates
+substantial uncertainty about technology cycle timing. The Monte Carlo
+paths implicitly sample scenarios where depreciation is faster or slower
+than the fitted curve.
+
+
+2. DATA COMPOSITION (DATACENTER GPUs)
+======================================
+
+2a. Data sources and volume
+---------------------------
+
+The datacenter GPU dataset comprises ~104,000 price observations across
+multiple sources (filtered to the model's 29 DATACENTER-segment GPUs only).
+The critical distinction is between SOLD transaction data (what buyers
+actually paid) and LISTING data (what sellers asked).
+
+  Source                                Count     Type
+  -------------------------------------------------------
+  Sold transactions (Tier 1):
+    eBay verified SOLD listings            200     Hand-verified eBay sold prices
+                                                   with item IDs (LH_Sold=1 filter)
+    Keepa Amazon price tracking             94     Monthly actual sale prices tracked
+                                                   via Amazon API (T4 and L4 only)
+    Scraped supplement (transactions)       56     eBay/IT Creations/ASA Computers
+                                                   executed prices (DC GPUs only)
+  Subtotal Tier 1 (transactions):          350     (0.3% of total)
+
+  Listings & asking prices (Tier 2):
+    Bloomberg/eBay listing scrape      103,132     Daily eBay ASKING prices 2024-2026,
+                                                   scraped across all DC GPU categories.
+                                                   These are what sellers list, NOT what
+                                                   buyers pay. Systematically overstates
+                                                   executable value by 15-30%.
+    Cloud pricing (implied GPU value)      252     Derived from cloud rental rates
+    Scraped supplement (estimates)           59     Analyst estimates, market ranges
+    Web scraped supplement                  27     Retail listing price scrapes
+    Vast.ai implied values                   8     GPU cloud marketplace rates
+  Subtotal Tier 2 (listings/estimates):103,478     (99.7% of total)
+
+  Total DC GPU data points:           103,828
+
+The dataset is dominated by Tier 2 listing data (99.7%) which provides
+dense time-series coverage for curve fitting. However, only 350 data
+points (0.3%) represent verified executed transactions.
+
+LISTING BIAS DISCLOSURE:
+
+The dominance of listing (asking price) data is a material consideration.
+Listing prices systematically overstate executable values by 15-30% for
+datacenter GPUs, based on observed listing-to-sale discounts.
+
+The model does NOT explicitly correct for listing bias. Specifically:
+
+  1. CURVE FITTING: The model uses weighted least squares with sigma_i =
+     max(y_i, 0.05), which weights observations proportionally to their
+     price level. This gives lower-priced observations more influence
+     (in relative terms), but does NOT specifically downweight listings
+     vs transactions — all data points at a given price level receive
+     equal treatment regardless of whether they represent a sold
+     transaction or an unsold listing.
+
+  2. TRANSACTION DATA: The 350 verified transaction points are mixed into
+     monthly median time series alongside the 103K listing points. When
+     both exist for the same GPU-month, eBay sold data takes priority
+     via a deduplication step. However, for the majority of GPU-months
+     where only listing data exists, the listing prices feed directly
+     into curve fitting with no discount applied.
+
+  3. VOLATILITY: The Monte Carlo sigma reflects parameter estimation
+     uncertainty (how confident the model is in its fitted curve
+     parameters), propagated through the covariance matrix. Noisy listing
+     data indirectly widens this uncertainty, making the confidence
+     intervals wider than they would be with cleaner data. This is a
+     conservative effect for tail risk analysis.
+
+  IMPLICATION: The model's central projections likely overstate true
+  secondary market clearing prices by some portion of the 15-30%
+  listing premium. This means the breach probabilities in Section 1
+  may be slightly understated. However, because the model fits to
+  monthly medians (not means), extreme listing outliers are partially
+  filtered. The net listing bias in the fitted curves is likely smaller
+  than the raw 15-30% listing premium but is not precisely quantified.
+
+Note: "Tier 1/Tier 2" here refers to data source quality (transactions vs
+listings), not the model's internal fitting tier classification (which
+refers to how many observations each GPU has for curve fitting).
+
+2b. Listing vs transaction price differences
+---------------------------------------------
+
+Systematic differences are observed in the scraped supplement (115 DC GPU
+data points with confidence grades; the 103K Bloomberg/eBay listing data
+does not carry confidence tags):
+
+  - HIGH confidence (primarily eBay sold): 46 points, mean $19,325
+  - MEDIUM confidence (mix of listings + sold): 50 points, mean $23,250
+  - LOW confidence (estimates, implied values): 19 points, mean $14,409
+
+The MEDIUM confidence data skews higher because it includes more new/retail
+listing prices, while HIGH confidence data includes more used/secondary
+market sold transactions. LOW confidence data includes implied cloud values
+(Vast.ai) which reflect utilisation-adjusted pricing and tend to be lower.
+
+The 103K Bloomberg/eBay listing prices do not have confidence grades but
+are known to be asking prices (not sold). Industry data suggests listing-
+to-execution discounts of 15-30% for datacenter GPUs.
+
+The model applies proportional error weighting during curve fitting, which
+gives natural weight to observations closer to the fitted curve. Higher
+confidence observations tend to cluster more tightly, receiving implicit
+(though not explicit) upweighting.
+
+
+3. SECONDARY MARKET EXECUTION
+===============================
+
+3a. Illustrative market prices
+-------------------------------
+
+Verified eBay SOLD transactions (illustrative selection from
+ebay_verified_supplement.csv; 200 datacenter GPU sold records):
+
+  GPU               Sold Count   Price Range       Source
+  -----------------------------------------------------------------
+  T4                   26        $490-$898         eBay sold (verified)
+  L4                   21        $1,899-$3,046     eBay sold (verified)
+  A100 SXM4 80GB       20        $2,995-$9,650    eBay sold (verified)
+  A100 PCIe 80GB       11        $1,297-$29,704   eBay sold (verified)
+  A40                  11        $4,000-$6,200     eBay sold (verified)
+  A100 SXM4 40GB        7        $2,299-$4,650    eBay sold (verified)
+  H200 NVL              4        $28,999-$32,998   eBay sold (verified)
+  H100 SXM5 80GB        4        $2,247-$14,000   eBay sold (verified)
+
+Transaction data covers April 2025 through March 2026, with the majority
+of observations concentrated in December 2025 - March 2026 (~4 months).
+All eBay sold data is from eBay.com (US domestic marketplace).
+
+Active listings / asking prices (NOT sold, as of March 2026):
+
+  GPU               Condition       Price           Source
+  -----------------------------------------------------------------
+  H100 PCIe 80GB    Used           $18,000-$23K    eBay active listings
+  H200 NVL          Pre-owned      $31,000-$32K    Reseller listings
+  V100 PCIe 32GB    Pre-owned      $770-$1,080     eBay active listings
+  T4                Pre-owned      $699-$1,100     eBay / Amazon listings
+
+Note: Active listings systematically overstate executable values by
+15-30%. Sold transaction data is the authoritative reference.
+
+DATA LIMITATION — H100/H200 TRANSACTION DEPTH:
+
+Verified sold transaction data for current-generation GPUs is thin
+relative to the installed base. The H100 SXM5 family has 6 verified
+sold records (4x 80GB, 1x 64GB, 1x 94GB), and the H200 family has 5
+verified sold records (4x H200 NVL at $28,999-$32,998 and 1x H200 SXM
+at $18,000). While non-zero, these sample sizes carry meaningful
+uncertainty. H100/H200 inventory is predominantly held under primary
+lease or hyperscaler deployment, limiting secondary market turnover.
+
+The Bloomberg/eBay listing scrape provides ~8,600 H100-family and ~200
+H200 listing data points for curve fitting, but these are asking prices
+subject to the 15-30% listing bias discussed in Section 2. As H200
+secondary supply increases through 2026-2027, transaction data density
+will improve. For now, H100/H200 projections carry higher uncertainty
+than older GPUs with deeper transaction histories (e.g., T4 with 26
+sold records, A100 SXM4 with 20).
+
+Typical ticket sizes: $700-$32,000 per unit. Enterprise lots (10+ units)
+trade through brokers (ALTA Technologies, Net Equity) at 5-15% discount
+to eBay retail.
+
+Time-to-sale observations (estimated from listing duration and market liquidity;
+not based on tracked transaction data):
+  - H100/H200: 1-7 days (high demand, liquid market)
+  - A100: 3-14 days (established market, moderate volume)
+  - V100/T4: 7-30 days (declining demand, price-sensitive buyers)
+
+3b. Stressed monetisation scenario (title transfer)
+----------------------------------------------------
+
+Under stressed conditions (forced liquidation, no warranty, bulk lot):
+
+  Recovery range:    40-65% of prevailing secondary market price (estimate
+                     based on ITAD broker market norms; not derived from
+                     project transaction data)
+  Timeline:          30-90 days for full lot disposition
+  Channel:           ITAD broker (ALTA Technologies, Net Equity, IT Creations)
+  Minimum lot value: Brokers typically require >$10,000 aggregate
+
+  For a dead/non-functional card:
+    Broker payout:   10-25% of working used price
+    Recycler payout: $0.50-$50 per card (weight-based PCB scrap)
+    Timeline:        7-21 days to recycler; 30-60 days to broker
+
+  Example: 100x H100 SXM5 80GB portfolio
+    Working value:   $960K-$1.5M (at $9,600-$15,000 each)
+    Stressed sale:   $384K-$975K (40-65% recovery)
+    Dead card sale:  $96K-$375K (broker at 10-25% of working)
+    Scrap value:     $1,500-$3,200 (recycler at $15-$32 each)
+    Timeline:        30-60 days (broker channel)
+
+
+4. OPERATIONAL CONTROLS & RMA PROCESS
+======================================
+
+These questions relate to operational frameworks that sit outside the
+depreciation model's scope. The model captures market-observable pricing
+outcomes but does not model OEM-specific RMA workflows, configuration
+tracking, or operating parameter compliance.
+
+Observations from the data:
+  - Cards traded as "used/tested" on eBay command 15-40% premium over
+    "used/untested" or "as-is" listings, suggesting buyer-side quality
+    verification is valued but not standardised
+  - No datacenter GPU variant in the dataset shows pricing discontinuities
+    attributable to warranty expiry or recertification events
+  - The model's carrier-adjusted flag (is_carrier_adjusted) accounts for
+    some condition-based pricing differences but does not distinguish
+    OEM-warranted vs. grey-market inventory
+
+
+5. EXPECTED LOSS: 5-YEAR / 10% STRUCTURE
+==========================================
+
+5a. Per-GPU expected loss
+-------------------------
+
+Expected loss = p(breach) x E[shortfall | breach], where shortfall is
+the difference between the 10% floor and the realised value.
+
+  GPU                              p(breach)  E[shortfall]   E[Loss]
+  -------------------------------------------------------------------
+  V100S PCIe 32GB                    8.84%      4.4 pp       0.391 pp
+  V100 SXM2 32GB                     8.50%      4.4 pp       0.376 pp
+  V100 SXM2 16GB                     8.80%      4.1 pp       0.359 pp
+  V100 PCIe 16GB                     8.93%      4.0 pp       0.355 pp
+  GH200                              6.94%      3.9 pp       0.272 pp
+  H100 SXM5 64GB                     5.68%      3.7 pp       0.211 pp
+  V100 PCIe 32GB                     4.24%      3.8 pp       0.159 pp
+  A100 SXM4 80GB                     3.32%      2.0 pp       0.066 pp
+  MI300X                             2.09%      2.4 pp       0.050 pp
+  Gaudi2                             2.02%      1.8 pp       0.036 pp
+  A100 SXM4 40GB                     1.82%      1.7 pp       0.030 pp
+  All others (<1% breach prob.)      <1.0%      <1.5 pp      <0.015 pp
+
+  (pp = percentage points of MSRP)
+
+5b. Portfolio expected loss (equal-weighted, all 29 DC GPUs)
+------------------------------------------------------------
+
+  Portfolio expected loss:     0.080 percentage points of MSRP
+  As fraction of 10% floor:   0.79%
+
+  Interpretation: For every $10M of notional exposure at the 10% floor,
+  the expected loss is approximately $8,000.
+
+  This is an extremely thin expected loss, driven by:
+    - Only 11 of 29 GPUs have p(breach) > 1%
+    - The highest-risk cards (V100 family) have low absolute MSRP ($10-$12K),
+      limiting dollar-weighted impact in a diversified portfolio
+    - The conditional shortfall is capped by the physical scrap floor
+      (0.02-1% of MSRP), meaning losses cannot exceed ~9.8 pp even in
+      the worst case (10% floor minus 0.2% scrap floor)
+
+5c. Risk concentration
+----------------------
+
+  V100-family cards contribute 71% of total portfolio expected loss
+  despite being only 17% of the card count (5 of 29 variants).
+
+  Excluding V100-era cards (non-V100 contribution to the 29-GPU portfolio):
+    E[L] contribution: 0.023 pp of MSRP (0.23% of floor)
+    On $10M notional: $2,300 of the $8,000 total E[L]
+    (Note: if recomputed as a standalone 24-GPU ex-V100 portfolio,
+    the per-GPU E[L] would be 0.028 pp / $2,800 on $10M)
+
+  This suggests that for a modern datacenter GPU portfolio (Ampere generation
+  and newer), the 10% floor structure has negligible expected loss.
+
+5d. Expected loss by GPU family
+--------------------------------
+
+  Family                    N   Mean E[L]/GPU   Family E[L]   Share of Total
+  --------------------------------------------------------------------------
+  V100 Family               5    0.328 pp        1.640 pp       71.1%
+  Standalone (T4/GH200)     2    0.136 pp        0.272 pp       11.8%
+  H100 Family               5    0.042 pp        0.211 pp        9.2%
+  Non-NVIDIA                3    0.029 pp        0.086 pp        3.7%
+  A100 Family               5    0.019 pp        0.096 pp        4.2%
+  H200 Family               2    0.000 pp        0.000 pp        0.0%
+  Ampere Inference          4    0.000 pp        0.000 pp        0.0%
+  Ada Lovelace              3    0.000 pp        0.000 pp        0.0%
+  --------------------------------------------------------------------------
+  ALL DATACENTER           29    0.080 pp        2.305 pp      100.0%
+
+  Risk is heavily concentrated in legacy hardware. V100 + Standalone
+  (T4/GH200) together account for 83% of total expected loss. Current-
+  generation families (H100, H200, Ada Lovelace) contribute under 10%
+  combined. The H200 and Ada Lovelace families have expected loss that
+  rounds to zero at the 10% floor (0.000pp at display precision),
+  though individual cards do have non-zero breach probabilities
+  (0.02-0.24%).
+
+
+NOTES ON SCOPE
+==============
+
+The following questions from the due diligence list could not be answered
+from the model data alone and require operational/commercial input:
+
+  - Configuration consistency tracking across cohorts (Q4a)
+  - Ongoing vs. recertification-based compliance monitoring (Q4b)
+  - OEM replacement framework specifics (Q4a)
+
+These are operational controls questions that depend on the specific
+deployment context, OEM agreements, and asset management framework in use.

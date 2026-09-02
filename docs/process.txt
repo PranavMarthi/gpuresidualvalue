@@ -1,0 +1,524 @@
+GPU SECONDARY MARKET DEPRECIATION ANALYSIS
+Process and Results
+March 2026
+
+
+THE PROBLEM
+
+Graphics processing units are capital assets. A company that buys an NVIDIA
+H100 for thirty thousand dollars or an RTX 4090 for sixteen hundred dollars
+needs to know what that hardware will be worth in three years, or five. The
+same question matters to anyone buying used or refurbished GPUs: are you
+getting a fair price, or overpaying for hardware that is about to become
+worthless?
+
+There is no Kelley Blue Book for GPUs. No standard depreciation table. No
+widely accepted model. Pricing is opaque, scattered across eBay listings,
+Amazon storefronts, enterprise resellers, and private deals. This project
+set out to build that model from scratch -- to collect real transaction data,
+fit mathematical depreciation curves to each GPU, and produce a ranking of
+which GPUs hold their value and which do not.
+
+
+THE DATA
+
+We started with roughly three hundred thousand cleaned price observations
+covering sixty GPU models. The data came from two sources.
+
+The first source was scraped retail and secondary-market listings from Amazon
+and eBay, covering June 2024 through mid-March 2026. Every observation
+included the GPU model name, the date, the condition (new, used, or
+refurbished), the price in US dollars, and the original manufacturer's
+suggested retail price.
+
+Twenty-two months of data is not enough to model five-year depreciation. To
+extend the history, we incorporated Amazon price tracking data from a service
+called Keepa, which silently records every Amazon price change going back
+years. This gave us pricing histories stretching back to each GPU's original
+launch date -- as far back as 2017 for models like the Tesla V100. For
+consumer GPUs like the RTX 3080, which launched in September 2020, we ended
+up with roughly sixty-six months of continuous price history.
+
+The limitation is datacenter GPUs. Models like the A100 and H100 are sold
+through enterprise channels, not Amazon. Keepa has no record of them. To
+address this, we built several supplementary data pipelines:
+
+eBay completed/sold listings (scrape_ebay_sold.py) target fifteen thin-data
+datacenter GPUs -- H100, H200, MI300X, Gaudi2, and others -- extracting
+actual transaction prices from eBay's sold listings database. Each listing
+is scored for confidence and filtered for accessories, multi-GPU systems,
+and extreme prices.
+
+Vast.ai rental pricing (scrape_vastai.py) queries the public API for current
+GPU cloud rental rates across all available hardware. Hourly rental rates
+are converted to implied three-year asset values as a cross-check for the
+depreciation models.
+
+Cloud GPU rental history (extract_cloud_pricing.py) processes a historical
+cloud pricing database spanning 2015 to 2024, extracting monthly rental
+rate time series for datacenter GPUs. Cloud rental rate decline over time
+serves as an independent signal of hardware depreciation.
+
+TechPowerUp specifications (scrape_techpowerup.py) cross-checks the curated
+MSRP and launch date constants against the TechPowerUp GPU database.
+
+A web-scraped supplement provides additional secondary-market observations
+from enterprise resellers and pricing aggregators.
+
+Together, these supplements substantially improve datacenter GPU coverage.
+Without them, datacenter GPUs rely on only the twenty-two-month retail
+window, which makes their five-year projections less reliable. With the
+full dataset, fifteen of sixty GPUs saw their projections shift by
+more than ten percentage points, concentrated in the datacenter segment.
+We are transparent about this throughout the analysis.
+
+An important distinction: the data sources differ in whether they represent
+executed transactions or listed/offered pricing. eBay completed/sold
+listings are confirmed transactions -- actual prices paid by buyers. Amazon
+retail listings and Keepa historical tracking are listed prices (offers
+rather than confirmed sales), though Amazon's high sell-through rate means
+listed and transacted prices are closely aligned for consumer GPUs. Cloud
+rental rates and enterprise reseller prices are offered rates used as
+cross-reference signals. The pipeline does not use indicative pricing from
+other models or consensus estimates -- a specific filter removes any
+supplementary rows flagged as "estimate," "age-based," or "consensus" to
+prevent circular dependency.
+
+
+CLEANING THE DATA
+
+Raw scraped prices are messy. The same GPU appears with different condition
+labels -- "New," "new," "NEW," "Renewed," "Open Box." Prices include
+data-entry errors, joke listings, and scraping artifacts. Some GPUs are
+currently selling above their original sticker price because of AI-driven
+demand shortages.
+
+We cleaned in stages. First we filtered to US-only data. The retail CSVs
+contain multi-country listings (US, UK, SG, FR, FI, ES, etc.) with prices
+in local currency mislabeled as USD. Non-US datacenter GPU prices are two
+to five times US levels (for example, a French A100 at forty-two thousand
+euros labeled as forty-two thousand dollars versus the actual US price of
+eight thousand eight hundred). This filter removes roughly eighty-five
+percent of rows but eliminates systematic price inflation for datacenter
+GPUs. The Keepa data is already US-only.
+
+Next we standardized every condition label into three categories: new, used,
+and refurbished. Anything that did not map to one of those -- like "For
+Parts" -- was discarded. Then we removed exact duplicate listings across
+our overlapping data files.
+
+We then applied a title-based junk filter. GPU listings attract non-GPU
+products: dead cards sold "as is," heatsink-only kits, riser cables
+mis-tagged as GPU products, and multi-GPU server bundles (DGX systems,
+server nodes) priced as single GPUs. The filter uses twelve junk keywords,
+six accessory keywords, and four server bundle keywords to remove these
+before they can contaminate the pipeline. Keepa data also passes through a
+renewed/refurbished product filter and a maximum age filter of seventy-two
+months.
+
+We established a single authoritative MSRP for each GPU using a curated
+reference table of official launch prices (MSRP_REFERENCE) as the primary
+source, with the median of all reported CSV MSRPs as a fallback for GPUs
+not in the reference table. This eliminates the five-to-ten percent
+variation that scraping introduces and corrects for reseller markups on
+datacenter GPUs. Several MSRPs were corrected from OEM bundle prices to
+standalone GPU prices: L4 from seven thousand to twenty-five hundred
+dollars, A40 from twenty-seven thousand five hundred to five thousand
+dollars, L40 from thirty-one thousand to seventy-five hundred dollars,
+and A16 from ninety-five hundred to twenty-eight hundred dollars.
+
+One GPU alias consolidation: the Tesla V100 FHHL (a low-profile form
+factor of the V100 PCIe 16 GB using the same die and targeting the same
+market) is aliased to the Tesla V100 PCIe 16 GB throughout the pipeline
+to avoid splitting a single product's price history across two names.
+
+For used V100 SXM2 bare modules, which are sold without the carrier board
+needed to install them in a server, we add a two-hundred-dollar carrier
+cost adjustment to reflect the true "usable equivalent" price. Without
+this, bare SXM2 modules appear artificially cheap and deflate the V100's
+depreciation floor.
+
+We removed any listing priced below a floor of the greater of ten percent
+of MSRP or fifty dollars, which catches scraper false positives
+(wrong-product matches, cables, accessories) without removing legitimately
+cheap old hardware. The floor was lowered from two hundred to fifty dollars
+so that inexpensive consumer GPUs (like the RTX 4060 at two hundred ninety-
+nine dollars MSRP) can show realistic depreciation below sixty-seven percent
+of MSRP. We also capped prices at three times MSRP to remove multi-GPU
+server bundles. For used and refurbished GPUs, age-tiered price caps apply:
+one and a half times MSRP for ages twenty-four to forty-eight months,
+seventy-five percent of MSRP for ages forty-eight to seventy-two months,
+and fifty percent of MSRP for ages beyond seventy-two months.
+
+The datacenter supplement (eBay sold listings, reseller prices) also filters
+out prediction and estimate rows from other pricing models to prevent
+circular dependency.
+
+Finally, we flagged GPUs currently experiencing demand shocks. If a GPU's
+recent new-condition median price exceeded one and a half times its MSRP over
+the past ninety days, based on at least three observations, we flagged it.
+These GPUs -- primarily the H100, H200, and several RTX 40-series models --
+are included in the main depreciation ranking but flagged separately with
+scenario analysis showing their projected trajectories under both
+shock-persists and normalisation assumptions.
+
+
+HOW WE BUILT THE DEPRECIATION CURVES
+
+The core of the analysis is fitting a mathematical curve to each GPU's price
+history and projecting it forward to the five-year mark. Every GPU's price
+is expressed as a ratio of its original MSRP. A ratio of 0.40 means the GPU
+retains forty percent of its launch price.
+
+A key methodological choice is the condition switch. For the first
+twenty-four months of each GPU's life (age less than or equal to twenty-four
+months), the pipeline uses NEW-condition price data -- reflecting the period
+when most units on the market are factory-fresh. After month twenty-four
+(age strictly greater than twenty-four), the pipeline switches to
+REFURBISHED or USED condition data, reflecting the reality that
+secondary-market transactions increasingly involve non-new units as
+hardware ages. For six GPUs where no refurbished
+or used data exists (H100 PCIe 80 GB, H100 SXM5 94 GB, H200 SXM, Gaudi2,
+H200 NVL, and GH200), the pipeline continues using NEW-condition data as a
+fallback for months twenty-four and beyond.
+
+We used two curve shapes. The first is exponential decay with a floor --
+the GPU loses a fixed percentage of its remaining value each month, but the
+price never drops below a minimum level because there are always some buyers
+willing to pay something for working hardware. The second is power-law decay
+with a floor -- a steeper initial drop that slows more gradually over time.
+Both shapes are standard in asset depreciation literature and both enforce
+that the GPU starts at one hundred percent of MSRP on its launch date.
+
+For each GPU, we fit both curves to the observed data and then blended them
+together, weighting each in proportion to how well it matched the historical
+prices. This blending -- called an Akaike-weighted ensemble -- is more
+robust than picking a single curve, because it hedges against either shape
+being wrong. If the exponential fit the data much better, the blend leans
+heavily toward it but still carries a small contribution from the power law.
+
+Not every GPU has enough data for an individual fit. We built a three-tier
+system to handle varying data richness.
+
+Tier one is for GPUs with eighteen or more months of history starting
+near their launch date. These get their own personalized curves fit to their
+own price data. Examples include the T4, the RTX 3080, and the Quadro RTX
+4000. Their projections carry the highest confidence.
+
+Tier two is for GPUs with some data but not enough for a fully independent
+fit. We borrow the general decay rate from the GPU's category peers --
+datacenter, workstation, or consumer -- and let the price floor adjust to
+match this specific GPU's observed prices. Think of it as knowing how cars
+in general depreciate, then adjusting for one specific car's current
+condition. Tier two now also uses forward projection from the current market
+price -- a conditional forecasting approach that anchors the curve to where
+the GPU is actually trading today, rather than relying solely on the
+historical trajectory. This matters most for GPUs whose recent prices have
+diverged sharply from their earlier trend. For very young GPUs like the
+H100, which has not yet shown visible depreciation, we use a statistical
+technique called an empirical Bayes prior to prevent the model from naively
+assuming the GPU will hold ninety-five percent of its value forever. The
+prior is built from how older datacenter GPUs in the same category actually
+aged, which pulls the H100's projected floor toward a more realistic
+thirty-to-forty percent rather than the uninformative ninety-five percent
+the raw data would suggest.
+
+Tier three is for GPUs with almost no data -- fewer than four months of
+observations, or where all fitting attempts produced implausible results.
+These simply receive the average depreciation curve for their category,
+scaled to their current observed price level.
+
+Every GPU also gets an uncertainty estimate. We ran ten thousand slightly
+varied versions of each curve, sampling from the statistical uncertainty in
+the fitted parameters. The final projection is the median of those ten
+thousand scenarios. The confidence interval spans the middle ninety-five
+percent of outcomes (using the Highest Posterior Density interval). Wide
+intervals mean the model genuinely does not know; narrow intervals mean it
+is fairly confident.
+
+One additional refinement: when NVIDIA announces a successor GPU generation,
+prices for the current generation typically drop twenty to forty percent
+within weeks. This is a discrete market event, not smooth depreciation, and
+including post-announcement data in the curve fit would inflate the estimated
+decay rate. We built a database of fifty successor announcement dates
+and, where sufficient pre-announcement data exists, fit the depreciation
+curve using only the pre-announcement window. This isolates the structural
+depreciation rate from the announcement step-change.
+
+
+THE DEPRECIATION RANKING
+
+We ranked every GPU on three metrics and combined them into a composite
+score. Demand-shocked GPUs are included in the ranking but also receive
+separate scenario analysis. The GPU ranked number one is the worst
+depreciator.
+
+The first metric is the terminal value ratio -- the projected price at year
+five divided by the original MSRP. Lower means worse. The second is dollar
+loss -- the actual cash value lost over five years. A nine-thousand-dollar
+GPU losing eighty-five percent of its value loses far more in absolute terms
+than a three-hundred-dollar card losing the same percentage. The third is the
+area under the depreciation curve (AUDC), capped at one point zero, which
+captures the total value experienced across all five years rather than just
+the endpoint. A GPU that holds its value for three years then crashes scores
+differently than one that crashes immediately, even if both end up at the
+same five-year price.
+
+Half-life is still reported as a display column but is no longer part of the
+composite score. It was removed because GPUs with NaN half-life (observed
+method or slow depreciators where floor exceeds fifty percent) would get a
+composite mean across three ranks while others get a mean across four, making
+scores non-comparable.
+
+Each GPU also receives a reliability rating (HIGH, MEDIUM, or LOW) based on
+both the fit tier and the confidence flag. HIGH requires Tier 1 data and a
+tight confidence interval. A confidence weight is also provided (Tier 1 =
+one point zero, Tier 2 = zero point seven, Tier 3 = zero point four) so
+downstream consumers can filter or weight by data quality. The MI210 has a
+special confidence guard: if it has fewer than twelve months of data or an
+age span below eighteen months, its reliability is capped at MEDIUM.
+
+The worst depreciators are uniformly old datacenter and workstation GPUs.
+The Tesla V100 family and other previous-generation datacenter accelerators
+consistently show the steepest depreciation, retaining only a small fraction
+of their original value at the five-year mark. These are GPUs that have been
+made obsolete by multiple successor generations and lack the hobbyist or
+enthusiast secondary market that cushions consumer cards. A gamer might buy
+a five-year-old RTX 3080 for nostalgia or budget reasons; almost nobody
+buys a five-year-old V100 unless they have legacy software that
+specifically requires it.
+
+At the other end, current-generation professional and enterprise GPUs with
+active deployment bases tend to retain the most value, benefiting from
+sustained secondary-market demand driven by professional user bases and
+enterprise deployment pipelines.
+
+Many consumer GPUs -- particularly the RTX 30-series and several RTX
+40-series models -- are currently trading at or above their original MSRP.
+This reflects AI-driven demand bleeding into the consumer market in 2025 and
+2026. Their long-run depreciation will likely be steeper once that demand
+normalizes. Their five-year projections carry low confidence for this reason.
+
+
+THE REFURBISHMENT PREMIUM
+
+We also investigated whether refurbished GPUs command a price premium over
+equivalent used units. The answer is yes, and it is statistically robust.
+
+The primary test was an ordinary least squares regression on the logarithm
+of price, controlling for GPU model, time period, and country. The refurbished
+coefficient translates to a premium of approximately nineteen percent over
+used -- meaning a GPU that sells for one thousand dollars in used condition
+would sell for roughly eleven hundred ninety dollars in refurbished condition.
+The statistical significance is very high, with a p-value below one in ten
+thousand.
+
+As a robustness check, we ran a cluster bootstrap that resamples entire GPU
+models rather than individual listings, preserving the temporal correlation
+within each GPU's price history. As a further decomposition, we ran
+individual t-tests for each GPU with enough data, applying a
+Benjamini-Hochberg false discovery rate correction to account for multiple
+comparisons. Thirty-nine out of forty-five tested GPUs individually showed a
+statistically significant positive premium after correction.
+
+The refurbishment premium is analogous to the certified pre-owned premium in
+the automotive market. Buyers are paying for inspection, testing, and
+warranty coverage -- reduced risk, not improved hardware. For businesses
+deploying GPUs in production where downtime from a defective card is costly,
+the nineteen percent premium is easily justified. For hobbyists comfortable
+testing hardware themselves, buying used and saving roughly one-fifth of the
+price is a reasonable trade.
+
+
+DEMAND SHOCK GPUs
+
+The H100 and H200 families are included in the main depreciation ranking
+but flagged as demand-shocked GPUs with separate scenario analysis. The
+H100 SXM5 variants are trading at several times their original MSRP on the
+secondary market.
+
+This is driven by the convergence of explosive demand for AI training
+compute, a manufacturing bottleneck that cannot be resolved quickly, and
+enterprise buyers willing to pay almost any price to secure capacity ahead of
+competitors. Their current pricing behaviour is fundamentally different from normal
+depreciation, driven by AI compute scarcity.
+
+We modeled two scenarios for these GPUs. In the first, the demand premium persists
+and the GPU decays gradually from its current elevated price toward the
+five-year mark. In the second, the price normalizes to MSRP as supply
+catches up with demand, then decays normally from there. The true outcome
+will land somewhere between. For conservative financial planning, the
+normalization scenario is the appropriate assumption.
+
+
+EXTENDED HORIZONS AND SUPPLEMENTARY ANALYSIS
+
+Projections now extend to one hundred twenty months (ten years), up from
+the original sixty-month window. The output includes projected values at
+every twelve-month interval from zero to one hundred twenty months
+(proj_t0 through proj_t120). The probability of falling below ten percent
+of MSRP is reported at the five-year, eight-year, and ten-year marks.
+
+As a supplementary validation, we implemented a hierarchical Bayesian model
+using PyMC. This model places segment-level hyperpriors on the decay
+parameters and allows GPU-level partial pooling, so that sparse-data GPUs
+borrow strength from their segment peers in a principled way. The
+hierarchical Bayes results show a zero point nine four eight correlation
+with the main scipy-based pipeline results, confirming the robustness of
+the primary methodology. The hierarchical model produces better estimates
+for GPUs with very sparse data, where the frequentist approach must fall
+back to segment defaults.
+
+
+POWERPOINT DECK
+
+The pipeline produces a PowerPoint presentation (make_deck.py) containing
+one slide per datacenter GPU chart sorted by TVR ascending (worst
+depreciators first), followed by family-level charts (Tesla V100, A100,
+H100, RTX 30-series, etc.) and segment overview charts (datacenter,
+workstation, consumer). Each per-GPU slide shows the GPU name, MSRP,
+TVR, five-year residual value in dollars, percentage loss, total data
+points, and data sources. The output is outputs/datacenter_gpu_deck.pptx.
+
+
+MONTE CARLO VALIDATION
+
+Two test scripts validate the Monte Carlo methodology:
+
+mc_convergence_test.py compares two thousand versus ten thousand MC
+samples across five representative GPUs (one per fitting pathway: Tier 1
+fitted, Tier 1 observed, Tier 2 constrained, Tier 3 default, and
+demand-shocked). It measures the coefficient of variation of CI
+percentiles across ten runs with different random seeds. The result
+confirmed that ten thousand samples produce stable CI estimates.
+
+test_mc_symmetry.py tests whether the MC posterior predictive distribution
+is approximately symmetric in log-space, which justifies using a normal
+approximation for the uncertainty bands. For each test GPU at each time
+point, it compares level-space versus log-space skewness and CI arm
+asymmetry.
+
+
+BACK-TESTING AND VALIDATION
+
+The model has been validated using temporal holdout tests. Four GPUs with
+sufficient history were tested by withholding the last six months of data,
+fitting on the remainder, and comparing the projected value against the
+actual observed price:
+
+    T4:                 projected 0.159, actual 0.153 (+3.9% error)
+    V100 PCIe 32 GB:    projected within 95% CI
+    A10:                projected within 95% CI
+    RTX 3090:           projected 1.13, actual 1.13 (+0.7% error)
+
+All four actual values fell within their respective 95% credible intervals.
+The RTX 3090 result is notable: with Keepa data extending the training
+window from twenty-two months to the full lifecycle (ages three to sixty
+months), the validation error dropped from +748% (retail-only data, no
+Keepa) to +0.7%.
+
+As a supplementary validation, a hierarchical Bayesian model implemented in
+PyMC produces independent estimates from a fundamentally different
+statistical framework. The Pearson correlation between the two models is
+0.948 across all GPUs, confirming the robustness of the primary methodology.
+
+A sensitivity analysis (sensitivity_analysis.py) tests stability by varying
+four key pipeline thresholds one at a time across their plausible ranges:
+TIER1_MIN_MONTHS, OBS_WINDOW, APPRECIATING_THRESHOLD, and
+TIER1_MAX_MIN_AGE. The depreciation ranking is robust across all tested
+threshold variations, with Spearman rank correlation exceeding 0.965 for
+every scenario.
+
+
+WHAT WE KNOW WE DON'T KNOW
+
+The analysis has clear limitations and we believe it is important to state
+them directly.
+
+Newer GPUs have less data. An H200 with six months of history gets a
+category-average projection, not an individualized one. Always check the
+confidence flag before acting on a number.
+
+Datacenter GPUs are our weakest area. Without Amazon historical pricing, they
+rely on only twenty-two months of retail data. Their projections lean on
+category averages and should be treated as rough guides.
+
+The model assumes smooth, continuous price decline. In reality, GPU prices
+drop suddenly when a successor is announced, when tariffs change, or when a
+mining cycle ends. We account for successor announcements explicitly, but
+other shocks are not modeled. The curves represent the average expected path;
+real prices will occasionally jump well above or below them.
+
+Once trading volume dries up, we lose visibility. The price floor we estimate
+reflects GPUs that are still actively changing hands. Units that have been
+scrapped or retired may be worth less than our floor suggests.
+
+We measure asset value depreciation only, not total cost of ownership. A GPU
+that holds its value well but draws four hundred watts may cost more to
+operate over five years than one that depreciates faster but sips one hundred
+fifty watts. Electricity and cooling costs are not included in this analysis.
+
+The pipeline underwent iterative refinement. Thresholds for data sufficiency,
+model quality gates, and parameter bounds were adjusted during development
+based on the data. While each adjustment was individually well-motivated, the
+cumulative effect is that results should be interpreted with awareness that
+the methodology was not pre-registered. Sensitivity analysis across
+threshold values has been performed and shows the ranking is robust
+(Spearman rho greater than 0.965 across all tested threshold variations).
+
+
+HOW MUCH DOES ADDITIONAL DATA HELP?
+
+We ran the pipeline twice -- once with only the twenty-two-month retail
+window, and once with the full dataset including Amazon historical prices and
+secondary market data from enterprise resellers and eBay. The difference was
+dramatic for expensive datacenter GPUs and negligible for consumer cards.
+
+With retail data alone, the H200 NVL was projected to retain ninety-seven
+percent of its value -- essentially the model admitting it had no information.
+With the full dataset, the projection dropped to thirty-five percent, a
+sixty-four percent downward revision. The H100 SXM5 64 GB went from
+fifty-nine percent to eighteen percent. All ten of the largest changes were
+downward, meaning the retail-only data systematically overstates how well
+datacenter GPUs hold their value.
+
+Consumer GPUs barely changed. The RTX 3080, RTX 3090, and T4 moved by less
+than two percent because they already had extensive price histories from
+Amazon tracking. The external data matters precisely where the pipeline was
+weakest -- the expensive datacenter hardware that lacks Amazon price history.
+
+Fifteen of fifty-six GPUs saw their projections shift by more than ten
+percentage points. Seven GPUs changed confidence rating. The mean revision
+across all GPUs was about seven and a half percentage points, but this
+average masks the concentration: datacenter GPUs moved by an average of nine
+percentage points while consumer GPUs moved by one.
+
+
+SUMMARY
+
+Most GPUs lose fifty to eighty-five percent of their value within five years.
+The decline follows a predictable pattern: steep in the first two years, then
+leveling off at a floor where residual demand sustains a minimum price.
+
+Datacenter GPUs depreciate the hardest. Previous-generation datacenter
+accelerators like the V100 family retain only a small fraction of their
+original value at the five-year mark, driven by rapid generational
+obsolescence and the absence of an enthusiast secondary market.
+
+Current-generation professional GPUs with active enterprise demand tend to
+hold value best, sustained by loyal professional user bases and ongoing
+deployment pipelines.
+
+The H100 and H200 are not normal depreciation stories right now. They are
+trading at multiples of MSRP due to AI compute scarcity. This will not last
+indefinitely.
+
+Refurbished GPUs cost about nineteen percent more than equivalent used units.
+The premium buys inspection, warranty, and reduced risk. Whether it is worth
+paying depends on the buyer's tolerance for hardware failure.
+
+Product cycle timing matters as much as the depreciation curve. When a
+successor generation is announced, prices for the previous generation drop
+twenty to forty percent within weeks. Anyone planning a significant purchase
+or sale should track the product roadmap calendar alongside any
+depreciation-based forecast.

@@ -1,0 +1,1307 @@
+STATISTICAL METHODOLOGY, MODEL DESIGN, AND RESULTS
+GPU Secondary Market Depreciation Analysis
+March 2026
+
+
+0. PIPELINE EXECUTION ORDER
+
+The full pipeline runs in this order:
+
+    keepa_prep.py → depreciation_curves.py → ranking.py
+    → sensitivity_analysis.py → generate_curves.py → generate_family_curves.py
+    → make_deck.py
+
+Library modules (imported, not run standalone):
+    data_prep.py — data loading, cleaning, MSRP/launch date constants
+
+Independent / standalone scripts:
+    refurb_premium.py — refurbishment premium statistical analysis
+    hierarchical_bayes.py — PyMC hierarchical Bayesian model (supplementary validation)
+
+Data acquisition scrapers (run as needed to refresh supplement data):
+    scrape_ebay_sold.py — eBay completed/sold listings for thin-data datacenter GPUs
+    scrape_techpowerup.py — TechPowerUp GPU database for MSRP/launch date verification
+    scrape_vastai.py — Vast.ai public API for GPU rental pricing
+    extract_cloud_pricing.py — cloud GPU rental rates from historical pricing database
+
+Bloomberg Terminal export (requires Bloomberg Terminal):
+    bloomberg_pull.py — one-time data export for cloud capex, crypto, etc.
+
+Test and validation scripts:
+    mc_convergence_test.py — validates MC sample size adequacy (2,000 vs 10,000)
+    test_mc_symmetry.py — validates log-space normality assumption for MC posteriors
+
+generate_curves.py produces individual depreciation chart images for every GPU.
+generate_family_curves.py produces pooled charts for GPU families and segments.
+make_deck.py produces a PowerPoint deck with per-GPU slides, family charts,
+and segment overview slides (outputs/datacenter_gpu_deck.pptx).
+
+
+1. FUNCTIONAL FORM SELECTION
+
+We model GPU price depreciation as a univariate function P(t) where t is
+months since launch and P is the price ratio (current price / MSRP). The
+dependent variable is normalised by MSRP so that all GPUs share a common
+scale regardless of price tier, and so that P(0) = 1.0 by construction.
+
+Two candidate functional forms were selected:
+
+    Exponential with floor:   P(t) = f + (1 - f) * exp(-k * t)
+    Power law with floor:     P(t) = f + (1 - f) * (t + 1)^(-b)
+
+where f is the long-run residual value floor, k is the exponential decay
+rate, and b is the power-law exponent.
+
+Both forms enforce P(0) = 1.0 by construction. The exponential model implies
+a constant proportional rate of value loss per unit time -- the asset loses
+a fixed fraction of its remaining above-floor value each month. The
+power-law model implies a declining rate -- depreciation is steepest
+immediately after launch and attenuates over time. Both converge to the
+floor parameter f as t approaches infinity.
+
+The power-law model was reparameterised from its original three-parameter
+form (f + a * (t+1)^(-b)) to eliminate the amplitude parameter a by setting
+a = 1 - f. The original form had a degree of freedom that allowed
+unphysical launch values (e.g., P(0) = f + a, which could exceed 1.0 when
+a > 1 - f). The reparameterisation removes this pathological regime and
+reduces the parameter count from three to two, making both candidate models
+equal in complexity.
+
+Why these two forms and not others: exponential decay is the standard model
+in the fixed-asset depreciation literature (Hulten & Wykoff, 1981). Power-law
+decay is used by the Bureau of Economic Analysis for certain asset classes
+and captures the empirical observation that depreciation decelerates over
+time. We considered but rejected linear decay (unphysical -- it implies the
+GPU reaches zero value at a finite time and then goes negative), logistic
+decay (three parameters, difficult to identify from sparse data), and
+spline-based approaches (overfit small samples). The two-model ensemble
+provides model-form hedging without the parameter explosion of more flexible
+specifications.
+
+
+2. PARAMETER BOUNDS
+
+Parameters are bounded during optimisation to prevent physically
+implausible fits:
+
+    floor f:  [0.001, 0.80]
+    k:        [0.005, 0.25]
+    b:        [0.01, 3.0]
+
+The floor bounds allow residual values from 0.1% (near-worthless) to 80%.
+The upper bound was lowered from 0.95 to 0.80, and the lower bound from
+0.01 to 0.001, to better accommodate GPUs at both extremes of the
+depreciation spectrum. The decay rate k = 0.005 corresponds to a half-life
+of approximately 138 months, effectively flat over any five-year horizon.
+k = 0.25 gives a half-life of 2.8 months -- the fastest plausible
+depreciation for any GPU in a functioning secondary market.
+
+These bounds were tightened from an earlier specification of k in [1e-4, 1.0].
+The original range permitted half-lives of 579 years (lower bound) and
+sub-one-month (upper bound), both unphysical. The revised bounds were
+informed by the empirical range of fitted parameters across the dataset and
+the constraint that any result should correspond to a recognisable
+depreciation trajectory.
+
+
+3. FITTING PROCEDURE
+
+Models are fit by nonlinear least squares via the Levenberg-Marquardt
+algorithm (scipy.optimize.curve_fit, maxfev = 12000). The objective function
+uses proportional (relative) error weighting:
+
+    sigma_i = max(y_i, 0.05)
+
+where y_i is the observed price ratio at time i. This makes the fitting
+criterion scale-invariant: a 10% deviation from the curve is penalised
+equally whether the GPU is at 80% of MSRP or at 20%. Without proportional
+weighting, high-value observations would dominate the fit and low-value
+tail observations would be effectively ignored. The floor of 0.05 prevents
+observations near zero from receiving unbounded leverage.
+
+The curve_fit call uses absolute_sigma = False, which means scipy
+internally rescales the covariance matrix by the reduced chi-squared
+statistic (chi2 / (n - p)). This is important: it inflates the covariance
+when the model is a poor fit (large residuals), which propagates into wider
+Monte Carlo uncertainty intervals downstream. The alternative
+(absolute_sigma = True) would treat the sigma_i as exact noise levels and
+produce overconfident covariance estimates when the model is misspecified.
+
+After curve_fit returns, the covariance matrix is inflated by a Bartlett
+serial-correlation correction factor. The lag-1 autocorrelation rho of the
+weighted residuals is estimated, and pcov is multiplied by (1+rho)/(1-rho).
+This accounts for the effective-sample-size reduction caused by temporal
+autocorrelation in monthly GPU price observations. For typical rho values
+of 0.3-0.7, this widens confidence intervals by a factor of 1.4-2.4x
+(sqrt of the covariance inflation).
+
+R-squared is computed in the same weighted space:
+
+    R2 = 1 - SS_res_w / SS_tot_w
+
+where SS_res_w = sum((y_i - pred_i)^2 / sigma_i^2) and
+SS_tot_w = sum((y_i - y_bar_w)^2 / sigma_i^2), with y_bar_w being the
+weighted mean. This ensures the R-squared value is consistent with the
+fitting objective and the AICc computation that follows.
+
+
+4. MODEL SELECTION: AICc-WEIGHTED ENSEMBLE
+
+Rather than selecting a single model, we compute Akaike weights from the
+corrected Akaike Information Criterion (AICc) and blend the two models in
+proportion to their relative support from the data.
+
+The AICc formula under the proportional-weight error model is:
+
+    AICc = SS_res_w + 2*k + 2*k*(k+1) / (n - k - 1)
+
+where k is the number of curve parameters (k = 2 for both models) and n
+is the number of observations. The correction term (Hurvich & Tsai, 1989)
+adjusts for small-sample bias in the standard AIC. Because both models share
+the same data and the same sigma_i weights, the constant terms in the
+Gaussian log-likelihood (involving sum of log(sigma_i)) cancel in the AIC
+differences and are omitted.
+
+Under this error model the noise variance is not a separately estimated
+parameter -- the sigma_i are treated as known weights -- so k_eff = k
+(the count of curve parameters only), not k + 1.
+
+Akaike weights are computed as:
+
+    delta_i = AICc_i - AICc_min
+    w_i     = exp(-0.5 * delta_i) / sum_j(exp(-0.5 * delta_j))
+
+following Burnham & Anderson (2002). When both models fit comparably, the
+ensemble gives roughly equal weight to each; when one clearly dominates, the
+ensemble is effectively single-model.
+
+In practice, we found that the power-law model dominated for most consumer
+and workstation GPUs (receiving weight > 0.99 in many cases), while the
+exponential and power-law split more evenly for datacenter GPUs with longer
+histories. The ensemble thus acts as an automatic model selector for GPUs
+where one form clearly fits better, while providing genuine blending for
+GPUs where the evidence is ambiguous.
+
+Quality gates precede the ensemble:
+
+  Gate 1: any model with R-squared below 0.20 is excluded before computing
+  weights. If both models fall below this threshold, the ensemble returns
+  no result and the GPU falls through to the next fitting tier.
+
+  Gate 2: MC median at t=0 must be <= 1.5 (back-extrapolation does not
+  imply an implausible above-MSRP launch price).
+
+  Gate 3 (boundary-hit detection): if any fitted parameter is pinned at
+  its bound (within tolerance 1e-4 of the bound range), the fit is flagged
+  as degenerate. This prevents boundary artifacts from producing Tier 1
+  results that appear well-fit (high R-squared) but are not meaningful.
+  For segment canonical fits, a floor <= 0.04 triggers the degenerate
+  detection (raised from 0.02).
+
+If any gate fails, the GPU falls through to Tier 2.
+
+
+5. THREE-TIER HIERARCHICAL FITTING
+
+5.0 CONDITION SWITCH
+
+Before curve fitting, the pipeline applies a condition-based data selection
+rule. For the first 24 months of each GPU's life (t <= 24), only NEW-condition
+price observations are used. After month 24 (t > 24), the pipeline
+switches to REFURBISHED and USED condition data. This reflects the market
+reality that new-condition units dominate early secondary-market listings,
+while refurbished and used units become the primary transaction type as
+hardware ages past two years.
+
+Six GPUs currently lack refurbished/used data entirely: H100 PCIe 80 GB,
+H100 SXM5 94 GB, H200 SXM, Gaudi2, H200 NVL, and GH200. For these GPUs,
+the pipeline falls back to NEW-condition data for months 24+. As
+refurbished/used listings accumulate for these models, the fallback will
+no longer be needed.
+
+Not every GPU has sufficient data for a robust individual fit. We built a
+three-tier system that gracefully degrades as data decreases:
+
+TIER 1 (INDIVIDUAL FIT): Requires 18+ monthly observations beginning
+before month 30 of the GPU's life. Both candidate models are fit
+independently to the GPU's own price history. The AICc ensemble produces the
+final projection and Monte Carlo uncertainty. Note: the observed method
+(direct use of the GPU's price history without parametric curve fitting)
+now serves as a fallback within Tier 1 when individual fits fail quality
+gates, rather than as a peer method alongside fitted results.
+
+TIER 2 (CONSTRAINED FIT): For GPUs with 4-17 months of data, or where
+Tier 1 fits failed quality gates. The decay rate k is fixed to the segment
+canonical value, and only the floor parameter f is estimated from the GPU's
+individual observations, regularised by an empirical Bayes prior. For
+Tier 2 constrained fits, the projection is anchored at the GPU's current
+observed market price (no cap -- if a GPU trades above MSRP, the forward
+projection starts from that elevated level and decays from there) rather
+than projecting from the theoretical launch price. This conditional
+forecasting approach produces more realistic projections for GPUs that have
+already depreciated significantly or are trading above MSRP.
+
+TIER 3 (SEGMENT DEFAULT): For GPUs with fewer than 4 observations or where
+all fits failed. The GPU receives the segment canonical curve scaled to its
+current observed price level.
+
+The tier assignment is strictly hierarchical. In our results, twenty-eight
+of sixty GPUs qualified for Tier 1 (observed or individual fit),
+twenty-eight fell to Tier 2 (constrained), and four landed in Tier 3
+(segment default). Eight GPUs were flagged as appreciating and received
+Tier 1 treatment but with LOW confidence due to the anomalous price
+direction.
+
+
+6. SEGMENT CANONICAL CURVES
+
+GPUs are partitioned into three market segments -- datacenter, workstation,
+and consumer -- each with a canonical depreciation curve fit to pooled
+monthly observations of all well-observed GPUs in that segment. The pooled
+fitting approach weights each GPU proportionally to its number of monthly
+observations.
+
+The datacenter canonical is now data-driven, anchored by the T4 (77 months
+of history), V100 variants, A10, A16, A30, and A100 PCIe variants. The
+consumer and workstation canonicals produced somewhat faster decay.
+
+Fallback values (SEG_K_FALLBACK) are provided for cases where the
+canonical fit is degenerate (R-squared < 0, k at upper bound, or floor
+<= 0.04). Current fallback values, informed by long-run eBay sold data:
+
+    DATACENTER:  k = 0.025, floor = 0.02
+        (K80 at 0.4-0.7%, V100 at 3-4% after 8-9 years)
+    CONSUMER:    k = 0.020, floor = 0.05
+        (GTX 980 Ti at 8% after 11 years; absolute $25-50 floor)
+    WORKSTATION: k = 0.018, floor = 0.03
+        (Quadro M6000 at 1.9%, K6000 at 1-2% after 11-13 years)
+
+When the pre-successor-only canonical fit is degenerate, the pipeline
+retries with all data (including post-successor observations). If the
+retry also fails (R-squared < 0.20 in strict mode), the handcrafted
+SEG_K_FALLBACK is used.
+
+
+7. EMPIRICAL BAYES FLOOR PRIOR
+
+For Tier 2 GPUs that have not yet shown visible depreciation (notably the
+H100 at ages 17-35 months), the floor parameter is weakly identified: the
+optimiser hits the upper bound of 0.95 because the short observation window
+shows no decline.
+
+We address this with a penalised WLS objective:
+
+    L(f) = SS_res_w(f) + lambda * (f - mu_prior)^2 / sigma_prior^2
+
+where lambda = max(0, 1 - n_eff / 36) ramps from full prior influence at
+zero months to pure data-driven estimation at 36+ months.
+
+For the datacenter segment, we computed a prior of mean = 0.491,
+sigma = 0.235, based on seven anchor GPUs with 48+ months of history. This
+prior was decisive for the H100 family: without it, H100 PCIe 80 GB
+returned TVR = 0.950 (the parameter boundary, not a real estimate). With
+the prior, the floor is pulled toward the 0.35-0.50 range, producing a
+more informative projection. Combined with the Tier 2 forward projection
+(which anchors at the current observed price rather than MSRP), the H100
+variants now produce TVRs well below the 0.950 boundary. The prior
+deliberately does not dominate the data, but the forward projection
+methodology provides the additional constraint needed to break through the
+boundary for GPUs still trading near MSRP.
+
+
+8. SUCCESSOR ANNOUNCEMENT ADJUSTMENT
+
+GPU prices exhibit a discrete step-change of 20-40% when the successor
+generation is publicly announced. We maintain a database of fifty successor
+announcement dates and fit Tier 1 curves using only pre-announcement data
+when 18+ months of pre-announcement observations are available.
+
+This adjustment is critical for the RTX 30-series. The RTX 3080 launched
+September 2020 and its successor (RTX 40-series) was announced September
+2022, giving exactly 24 months of pre-announcement data. Without the
+adjustment, the fitted k would absorb the September 2022 price drop and
+overstate the structural decay rate. With the adjustment, the pre-
+announcement k reflects pure depreciation, and the announcement effect is
+isolated. We found that the successor step-change accounted for approximately
+20-35% of the total price decline in the RTX 30-series fitting window.
+
+
+9. MONTE CARLO UNCERTAINTY PROPAGATION
+
+Uncertainty is quantified via 10,000 Monte Carlo draws (increased from
+5,000) from the fitted parameter covariance matrix. Each draw samples
+parameters from N(theta_hat, Sigma_hat), evaluates the model, and the
+ensemble combines using fixed Akaike weights. The covariance is regularised
+with a ridge term (1e-6 * |trace|) and a condition number gate (threshold
+1e10).
+
+The final projection is the median of the 10,000 draws. The 95% credible
+interval uses the Highest Posterior Density (HPD) method -- the shortest
+interval containing 95% of samples -- rather than equal-tailed percentiles.
+HPD is preferred for skewed posteriors (common near parameter bounds) and
+keeps the point estimate near the centre of the band. sigma_yr5 is the
+sample standard deviation of the t = 60 column. p_below_10pct is now
+reported at three horizons: 5-year (t=60), 8-year (t=96), and 10-year
+(t=120).
+
+Projections extend to 120 months via CURVE_TIMES = [0, 12, 24, 36, 48,
+60, 72, 84, 96, 108, 120]. The output CSV includes proj_t72 through
+proj_t120 columns alongside the original proj_t0 through proj_t60.
+
+For Tier 2, floor and k are sampled jointly with cross-covariance derived
+from the segment canonical correlation structure, preserving the negative
+floor-k correlation that is intrinsic to the exponential model. Tier 2 and
+Tier 3 scale factors include +/-20% stochastic noise (uniform) to reflect
+uncertainty in the current observed price level, with scale clips widened
+from [0.5, 2.0] to [0.3, 2.5].
+
+Half-life for Tier 2/3 GPUs now uses _half_life_from_curve() (linear
+interpolation on the projected curve) instead of _half_life_exp() (the
+analytical formula). Half-life values below 1.0 month are treated as NaN
+(boundary artifact at t=0).
+
+
+10. DEPRECIATION CURVE RESULTS: DATACENTER GPUs
+
+The datacenter segment contains the most commercially important GPUs and
+also the widest range of data quality. Results are presented in order of
+reliability.
+
+NOTE: The specific TVR values, CIs, and tier assignments described below
+are illustrative and were captured at a point in time. The pipeline is
+iteratively improved and rerun; for current values, consult
+outputs/curve_fit_results.csv. The R-squared quality gate is
+0.20 — GPUs with individual R-squared below this threshold fall to Tier 2
+(constrained) or Tier 3 (segment default).
+
+T4 (MSRP $2,299)
+The single most data-rich GPU in the analysis, with extensive history
+spanning from near-launch to the five-year mark. The T4 has actual
+secondary-market data at the five-year point, making its projection
+among the most trustworthy. Note: specific TVR values have shifted
+across pipeline iterations as the model was refined (see
+outputs/curve_fit_results.csv for current values). The T4's depreciation
+curve shows a gradual decline from 100% at launch, with residual demand
+sustained by inference workloads and edge AI deployments where the card's
+70W power envelope remains attractive.
+
+A100 PCIe 40 GB (MSRP ~$11,000)
+Twenty-two months of data covering ages 49-69. The five-year TVR is 0.986
+with a CI of [0.875, 1.194] (width = 0.319). This is a LOW confidence
+observed result. The A100 PCIe 40 GB is currently trading near its MSRP
+because enterprise demand for A100 inference capacity remains strong in
+early 2026. The 98.6% retention reflects current market conditions, not necessarily where the card
+will be once the H100 and B100 are widely available in the secondary market.
+The observation window captures ages 37-57, which is late enough in the
+lifecycle that the GPU has been through one successor announcement (H100,
+March 2022) but early enough that scarcity-driven AI demand is still
+sustaining prices. A buyer relying on this TVR should understand that it
+may not persist as the datacenter GPU supply chain normalises.
+
+A100 PCIe 80 GB (MSRP ~$13,000)
+Twenty-two months of data, ages 32-52. TVR = 0.615, CI = [0.034, 0.748],
+LOW confidence. This variant tells a very different story from its 40 GB
+sibling: it has depreciated to 61.5% of MSRP. The divergence is driven by
+the 80 GB variant's higher initial price and its position in the market --
+the 80 GB SKU competes directly with the H100 for training workloads, while
+the 40 GB variant occupies a different (inference-oriented) niche where
+the H100 is less of a direct substitute.
+
+A100 SXM4 40 GB (MSRP ~$11,000)
+Eighteen months of data, ages 51-70. TVR = 0.354, CI = [0.209, 0.891],
+LOW confidence, observed. Retains roughly 35% of MSRP -- significantly
+less than the PCIe variant. The SXM form factor is harder to deploy in
+non-DGX systems, limiting the secondary market buyer pool.
+
+A100 SXM4 80 GB (MSRP ~$15,000)
+Nineteen months covering ages 22-52. The projected five-year TVR is 0.743
+with a wide CI of [0.467, 0.955]. This result should be interpreted with
+caution -- the wide confidence interval spans from substantial depreciation
+to near-MSRP retention, reflecting genuine uncertainty about the trajectory
+of AI-driven demand.
+
+H100 PCIe 80 GB (MSRP ~$25,599)
+Nineteen months of data, ages 6-36. Tier 2 constrained fit with
+k fixed from the datacenter canonical. The TVR is 0.923 with
+a 95% CI of [0.511, 1.550], and the confidence flag is LOW. The Tier 2
+forward projection anchors at the GPU's current observed market price
+rather than projecting from the theoretical launch price, producing a
+higher TVR than earlier pipeline runs that projected from MSRP. Note:
+this GPU uses NEW-condition data as a fallback for months 24+ because
+no refurbished/used data is available.
+
+What this means in practice: the H100 PCIe is now projected to retain
+roughly 92% of its MSRP at year five, consistent with the datacenter
+canonical trajectory anchored by the T4. The wide confidence interval
+reflects remaining uncertainty -- the H100 may genuinely hold value better
+than predecessors if AI demand remains structurally elevated.
+
+H100 SXM5 80 GB (MSRP ~$30,000)
+Thirty months of data, ages 0-36. TVR = 0.743 with CI =
+[0.694, 0.960]. The TVR depends heavily on the datacenter segment canonical
+and the empirical Bayes floor prior. With the full dataset (including Keepa
+and supplement), the projection is more informed than with retail data
+alone. This is a MEDIUM confidence result.
+
+H100 SXM5 64 GB (MSRP ~$25,000)
+Five months of data, ages 30-36. Tier 2 constrained. The TVR is 0.260 with
+a CI of [0.154, 0.438] -- this CI reflects the parametric precision
+of the datacenter canonical curve, not genuine certainty about this
+specific GPU. The confidence flag is MEDIUM.
+
+H200 NVL (MSRP ~$32,000)
+Zero months of usable data. Tier 3 segment default. The TVR is 0.593 with
+CI = [0.395, 0.801]. This is one of the least reliable projections in the
+datacenter segment, projected using the average datacenter curve. The
+projection should be treated as a rough ballpark only. Note: this GPU
+uses NEW-condition data as a fallback because no refurbished/used data
+is available. See curve_fit_results.csv and Section 18 for
+the comparison.
+
+H200 SXM (MSRP ~$35,000)
+Seven months of data, ages 16-24. Tier 2 constrained. TVR = 0.667 with
+CI = [0.326, 0.981]. Currently flagged as a demand shock. LOW confidence.
+The 66.7% TVR is influenced by the short observation window and the
+Tier 2 constraint. Note: this GPU uses NEW-condition data as a fallback
+for months 24+ because no refurbished/used data is available. Like the
+H100, this figure should be read with caution given the limited
+depreciation history available.
+
+L4 (MSRP $7,000)
+Twenty-two months of data, ages 17-37. Tier 2 constrained. TVR = 0.317
+with CI = [0.189, 0.533]. MEDIUM confidence. The L4 is one of the few
+mid-lifecycle datacenter GPUs where we have enough data for a meaningful
+Tier 2 result. The TVR reflects the L4's position as an inference-class
+accelerator, though the CI indicates moderate uncertainty about the
+long-term trajectory.
+
+L40S (MSRP ~$7,500)
+Twenty months, ages 11-31. Currently appreciating (1.05x MSRP) and
+flagged as a demand shock. Tier 2. TVR = 0.945 with CI = [0.499, 1.217].
+LOW confidence. The estimate has moved off the parameter boundary but the
+CI reflects continued uncertainty.
+
+
+11. DEPRECIATION CURVE RESULTS: CONSUMER GPUs
+
+The consumer segment tells a surprising story: most RTX 30-series GPUs are
+currently trading above their original MSRP despite being four to five
+years old. This is unprecedented in GPU market history and reflects the
+bleeding of AI/ML demand into the consumer market in 2025-2026.
+
+GeForce RTX 3080 (MSRP $699)
+Twenty-nine months of data covering ages 1-66. The five-year TVR is 0.815 --
+the RTX 3080 is projected to retain 81.5% of MSRP at year five. The 95%
+CI is [0.676, 0.907]. MEDIUM confidence based on direct observation.
+
+The RTX 3080 went through a complete demand cycle: launch at $699 (Sept
+2020), spike to $1,400+ during the crypto mining boom (2021), crash back to
+$600 after The Merge (Sept 2022), and gradual recovery driven by AI demand
+(2024-2026). The successor announcement adjustment isolates the pre-
+September 2022 depreciation rate. With the condition switch methodology,
+the pipeline uses NEW data for the first 24 months, then switches to
+REFURBISHED/USED data for months 24+, producing a more realistic long-term
+depreciation trajectory.
+
+GeForce RTX 3090 (MSRP $1,499) and RTX 3090 Ti (MSRP $1,999)
+TVR = 0.743 and 0.840 respectively. Both retain significant value with
+MEDIUM confidence. The same dynamics apply as the RTX 3080 -- the
+RTX 40-series successor generation launched at higher MSRPs, making the
+3090 and 3090 Ti relatively attractive on the secondary market.
+
+GeForce RTX 4060 through RTX 4090 (MSRP $299-$1,599)
+The RTX 40-series presents the most challenging fitting problem in the
+consumer segment. Most variants have 26-41 months of data but are currently
+trading above MSRP (price ratios of 1.07-1.47), flagged as appreciating
+and/or demand-shocked. Tier 2 constrained fits dominate this group, and all
+receive LOW confidence flags.
+
+The RTX 4090 is a notable outlier: its TVR is 0.177, substantially lower
+than the rest of the 40-series, reflecting its demand-shock dynamics and
+steeper projected depreciation trajectory. Other RTX 40-series models
+produce TVRs spanning a wide range: RTX 4060 Ti 8 GB at 0.853, RTX 4070
+SUPER at 0.969, RTX 4070 Ti at 0.987, RTX 4060 at 1.010, RTX 4070 at
+1.028, RTX 4080 SUPER at 1.088, RTX 4070 Ti SUPER at 1.100, RTX 4060 Ti
+16 GB at 1.147, RTX 4080 at 1.234, and RTX 4090 D at 1.306. Many of
+these are currently appreciating. A buyer should not interpret above-MSRP
+TVRs as reliable long-term projections -- they reflect current AI-driven
+demand that will likely normalise.
+
+GeForce RTX 4090 D (MSRP varies)
+Only four months of data at ages 11-13. Tier 2 constrained with the widest
+CI in the consumer segment: [1.004, 1.510], sigma_yr5 = 0.14.
+This is the single least reliable consumer GPU projection given the
+extremely short observation window.
+
+
+12. DEPRECIATION CURVE RESULTS: WORKSTATION GPUs
+
+Quadro P5000 (MSRP $2,499)
+Twenty-two months of data, ages 95-115. TVR = 0.338, CI = [0.175, 0.586],
+LOW confidence. The Quadro P5000 provides strong evidence for the
+workstation depreciation pattern: a decline to roughly 34% retention at
+year five, sustained by professional CAD/DCC users who value driver
+stability and ISV certification over raw performance.
+
+Quadro RTX 4000 (MSRP $900)
+Forty-two months of data, ages 4-88. TVR = 0.666 with a CI of
+[0.615, 0.673]. Despite the long observation window, the Quadro RTX 4000's
+price has been volatile -- it dipped below $600 after the RTX A-series
+launched, then recovered as workstation demand for affordable Turing-class
+cards persisted. The 66.6% retention at year five is a HIGH confidence
+direct observation.
+
+RTX A6000 (MSRP $4,650) and RTX A5000 (MSRP $2,249)
+RTX A6000 has TVR = 1.204 and RTX A5000 has TVR = 0.945. The A6000 is
+currently appreciating, while the A5000 is near MSRP. These workstation
+cards are benefiting from the same AI-driven demand uplift that affects the
+consumer RTX 30/40-series. The A6000's 48 GB VRAM makes it an attractive
+option for AI workloads that do not require datacenter-class hardware,
+sustaining above-MSRP pricing.
+
+RTX 4000 Ada Generation (MSRP $1,250)
+Twenty-six months, ages 13-38. Tier 2 constrained. TVR = 1.012 with
+CI = [0.660, 1.057]. LOW confidence. The above-MSRP TVR suggests the Ada
+workstation line will depreciate only modestly over five years, though
+the estimate remains near MSRP, indicating the model sees limited
+depreciation in the observation window.
+
+
+13. REFURBISHMENT PREMIUM RESULTS
+
+The confirmatory OLS test found a refurbishment coefficient of +0.177 on
+the log-price scale, translating to a premium of +19.4% over used-condition
+GPUs (95% CI: +14.9% to +24.1%, p < 0.0001). The test controlled for GPU
+model and time period via fixed effects, with cluster-robust standard errors
+at the GPU level (~54 clusters).
+
+The overall model R-squared is 0.885, but this is dominated by the GPU
+fixed effects (a $300 RTX 4060 and a $25,000 H100 are in the same
+regression). The condition coefficient explains the within-GPU, within-month
+price gap between used and refurbished listings -- a much smaller fraction
+of total variance, but a statistically well-identified one.
+
+The cluster bootstrap (2000 iterations, GPU-level resampling) produced a
+wider 95% CI that may include zero. This is expected: the bootstrap
+estimates the unconditional median-of-medians premium without controlling
+for GPU or time, which is a different and noisier estimand than the
+conditional OLS coefficient. The disagreement reflects GPU-level
+heterogeneity, not weakness in the OLS result.
+
+Per-GPU exploratory t-tests (Welch, unequal variance) with Benjamini-
+Hochberg FDR correction at q = 0.10 showed 39 of 45 testable GPUs with
+individually significant positive premiums. Power analysis (minimum
+detectable Cohen's d = 0.30 at 80% power) excluded 9 GPUs from testing
+due to insufficient sample sizes.
+
+The magnitude of the premium varies substantially across GPUs. Some
+datacenter cards show premiums exceeding 40%, while some consumer cards
+show premiums near zero or slightly negative. The +19.4% figure is the
+market-wide average conditional on GPU and time -- individual GPU premiums
+should be evaluated using the per-GPU decomposition.
+
+
+14. DEMAND SHOCK RESULTS
+
+Seven GPUs were flagged as currently demand-shocked (recent NEW price
+above 1.5x MSRP): H100 SXM5 64 GB (13.9x MSRP), GeForce RTX 3060
+(1.08x, just triggered by timing), and several RTX 40-series variants.
+
+For the H100 SXM5 64 GB, the two scenarios project:
+
+    Scenario A (shock persists, decays from 13.9x):
+        Five-year TVR approximately 3.6x MSRP
+        This represents a loss of approximately 74% from current market
+        value, even under the assumption that the shock premium partially
+        persists.
+
+    Scenario B (normalises to MSRP, then decays):
+        Five-year TVR approximately 0.33x MSRP
+        This represents a loss of approximately 67% from MSRP, consistent
+        with the datacenter canonical trajectory.
+
+The proxy decay parameters use per-segment values from SEG_K_FALLBACK
+(DATACENTER: k = 0.025, floor = 0.02; CONSUMER: k = 0.020, floor = 0.05;
+WORKSTATION: k = 0.018, floor = 0.03), with a default fallback of
+k = 0.020, floor = 0.15 for GPUs whose segment is not in the table.
+
+
+15. VALIDATION RESULTS
+
+The temporal holdout (last six months withheld) was performed on four GPUs:
+
+    T4:                 projected 0.159, actual 0.153 (+3.9% error)
+    V100 PCIe 32 GB:    projected within CI
+    A10:                projected within CI
+    RTX 3090:           projected 1.13, actual 1.13 (+0.7% error)
+
+All four actual values fell within their respective 95% credible intervals.
+The RTX 3090 result is notable: with Keepa data extending the training
+window from 22 months to the full lifecycle (ages 3-60), the validation
+error dropped from +748% (retail-only data, no Keepa) to +0.7%. This
+demonstrates the critical importance of the Keepa extension for consumer
+GPUs.
+
+
+16. SUMMARY OF KEY QUANTITATIVE FINDINGS
+
+The most trustworthy five-year projections in the analysis (values are
+illustrative and shift with each pipeline run — consult
+outputs/curve_fit_results.csv for current numbers):
+
+    T4:                 Most data-rich GPU (MEDIUM/HIGH, extensive history)
+    A100 SXM4 40 GB:    Well-observed datacenter (LOW, 18 months, observed)
+    A100 PCIe 80 GB:    Well-observed datacenter (LOW, 22 months, observed)
+    Quadro P5000:        Long-observed workstation (LOW, 22 months, constrained)
+    Quadro RTX 4000:     Long-observed workstation (HIGH, 42 months, observed)
+    L4:                  Mid-lifecycle datacenter (MEDIUM, 22 months, constrained)
+
+The least reliable projections (consult curve_fit_results.csv
+for current values — these shift with each pipeline run):
+
+    H100 PCIe 80 GB:     Tier 2 constrained, LOW confidence (NEW fallback)
+    H100 SXM5 80 GB:     Tier 1 fitted, MEDIUM confidence
+    RTX 4090 D:          Tier 2 constrained, LOW confidence (4 months of data)
+    H200 NVL:            Tier 3 segment default, LOW confidence (NEW fallback)
+
+The refurbishment premium: +19.4% (p < 0.0001, 95% CI: +14.9% to +24.1%).
+Thirty-nine of forty-five individually testable GPUs show statistically
+significant positive premiums after FDR correction.
+
+The core finding is that GPU depreciation follows a predictable two-phase
+pattern -- steep initial decline followed by a floor -- but the five-year
+endpoint varies enormously by segment: previous-generation datacenter GPUs
+(V100, T4) and older consumer flagships show the steepest declines,
+workstation GPUs with long histories occupy a middle range, and consumer
+GPUs like the RTX 3080/3090 that have benefited from AI demand spillover
+retain the most value. The condition switch methodology (NEW data for
+months 0-24, REFURBISHED/USED for months 24+) produces more realistic
+long-term projections than using a single condition throughout.
+
+
+17. KNOWN STATISTICAL LIMITATIONS
+
+Serial correlation in monthly data means the raw covariance from curve_fit
+underestimates parameter uncertainty. We apply a Bartlett correction factor
+(1+rho)/(1-rho) to pcov, where rho is the estimated lag-1 autocorrelation
+of the weighted residuals. This inflates the covariance to approximate the
+effective-sample-size reduction from autocorrelation, widening the MC
+confidence intervals. For typical GPU monthly data with rho in [0.3, 0.7],
+this inflates pcov by a factor of 1.9-5.7x. The correction is applied in
+fit_model() before the covariance enters the MC pipeline. This partially
+addresses the serial correlation issue but is a first-order approximation;
+a full Newey-West or HAC correction would be more rigorous.
+
+Neither the exponential nor the power-law form may be the correct
+functional form. The AICc ensemble hedges between two candidates but does
+not account for the possibility that both are wrong.
+
+The dataset only captures GPUs that are actively trading. The estimated
+price floor represents tradeable market value, not liquidation or scrap
+value.
+
+The pipeline's thresholds were refined during development against the data.
+While each choice is individually motivated, sensitivity analysis across
+threshold values has been performed and shows the ranking is robust
+(Spearman rho > 0.965 across all tested threshold variations). Results
+should be interpreted with this context.
+
+The H100 and H200 projections, which are the most commercially important
+numbers in the analysis, are also the least statistically reliable. This is
+an inherent tension: the GPUs with the highest stakes are the ones with the
+least depreciation history. The empirical Bayes prior partially addresses
+this by borrowing strength from predecessor GPUs, but a 17-month-old GPU
+that has never declined in price simply does not contain enough information
+to project a five-year trajectory with confidence.
+
+
+18. DATA SOURCE IMPACT ANALYSIS: RETAIL-ONLY vs FULL DATA
+
+We ran the pipeline twice to measure the impact of external data sources:
+
+    Run A ("Retail Only"):  tier3_2024/2025/2026 retail CSVs only (~22 months)
+    Run B ("Full Data"):    retail + Keepa historical + webscraping supplement
+
+Both runs processed 60 GPUs. Results compared side by side:
+
+AGGREGATE IMPACT:
+    Mean absolute TVR change:     0.076
+    Median absolute TVR change:   0.000 (most consumer GPUs unaffected)
+    GPUs with |change| > 0.10:    15 of 60 (25%)
+    GPUs with |change| > 0.05:    21 of 60 (35%)
+    GPUs with changed fit tier:   2
+    GPUs with changed confidence: 7
+
+The external data (Keepa + webscraping) primarily affects datacenter GPUs, which
+rely on the 22-month retail window in the retail-only run. Consumer GPUs with
+Keepa coverage see minimal change because the "observed" method at t=60 already
+anchors their projection to real data near the five-year mark.
+
+TOP 10 LARGEST TVR CHANGES (retail-only vs full data):
+
+    H200 NVL                    0.974 -> 0.353  (-0.621, -63.7%)
+    H100 SXM5 64 GB             0.589 -> 0.177  (-0.412, -69.9%)
+    Tesla V100 SXM2 16 GB       0.415 -> 0.053  (-0.361, -87.2%)
+    Tesla V100 FHHL              0.446 -> 0.141  (-0.305, -68.4%)
+    Tesla V100 PCIe 16 GB       0.416 -> 0.113  (-0.303, -72.8%)
+    Tesla V100 SXM2 32 GB       0.421 -> 0.130  (-0.291, -69.1%)
+    Quadro RTX 6000             0.620 -> 0.390  (-0.230, -37.1%)
+    GeForce RTX 4090            0.743 -> 0.551  (-0.192, -25.8%)
+    Tesla V100 PCIe 32 GB       0.435 -> 0.253  (-0.181, -41.6%)
+    Quadro RTX 4000             1.014 -> 0.845  (-0.169, -16.7%)
+
+All ten largest changes are downward revisions, meaning the retail-only run
+systematically overstates GPU value retention. The external data introduces
+longer price histories that capture the post-peak depreciation trajectory
+missing from the 22-month retail window.
+
+EXPENSIVE GPU DETAIL:
+
+    H100 SXM5 80 GB:
+        Retail-only: TVR = 0.873  CI = [0.595, 0.981]  Tier 2  LOW
+        Full data:   TVR = 0.950  CI = [0.623, 0.950]  Tier 2  LOW
+        The full-data run hits the 0.950 parameter boundary, indicating the
+        Keepa + supplement data for H100 SXM5 does not yet break through the
+        floor constraint. The scraped data (showing $14K used on eBay at age
+        42 months, implying ratio ~0.47) is captured by the supplement but
+        the Tier 2 constrained fit with the datacenter canonical k still
+        produces a boundary result. A more aggressive prior or lower floor
+        bound would be needed to fully utilise the scraped price decline.
+
+    H100 SXM5 64 GB:
+        Retail-only: TVR = 0.589  CI = [0.381, 0.810]  Tier 3  LOW
+        Full data:   TVR = 0.177  CI = [0.161, 0.192]  Tier 3  MEDIUM
+        Massive -69.9% revision. The supplement data shifts the segment
+        canonical anchor, producing a much lower Tier 3 default. Confidence
+        improved from LOW to MEDIUM because the tighter canonical narrows CI.
+
+    H100 PCIe 80 GB:
+        Retail-only: TVR = 0.456  CI = [0.255, 0.761]  Tier 2  LOW
+        Full data:   TVR = 0.353  CI = [0.013, 0.706]  Tier 2  LOW
+        -22.5% revision. The supplement adds pricing data that pulls the
+        constrained floor downward.
+
+    H200 NVL:
+        Retail-only: TVR = 0.974  CI = [0.649, 1.314]  Tier 3  LOW
+        Full data:   TVR = 0.353  CI = [0.323, 0.383]  Tier 3  LOW
+        Largest single change: -63.7%. The retail-only run had essentially no
+        information (1 month of data, segment default). The full-data run
+        benefits from a more informed datacenter canonical curve.
+
+    H200 SXM:
+        Retail-only: TVR = 0.704  CI = [0.382, 0.958]  Tier 2  LOW
+        Full data:   TVR = 0.604  CI = [0.189, 0.950]  Tier 2  LOW
+        -14.3% revision.
+
+    A100 SXM4 80 GB:
+        Retail-only: TVR = 1.167  HIGH (appreciating)
+        Full data:   TVR = 1.167  HIGH (appreciating)
+        No change. The A100 SXM4 80 GB uses the "observed" method (real data
+        near t=60), which bypasses curve fitting entirely. The supplement data
+        for this GPU exists but does not affect the observed-method path. The
+        model sees actual transactions near age 50 still above MSRP and
+        reports that directly. The scraped data showing $4.5-7K used at age
+        52 months (ratio ~0.30-0.47) contradicts this, suggesting the
+        retail CSV data and the scraped secondary market data are measuring
+        different buyer populations. This discrepancy warrants investigation.
+
+    T4:
+        Retail-only: TVR = 0.155  HIGH
+        Full data:   TVR = 0.153  HIGH
+        Negligible change (-1.5%). T4 has 78 months of direct observation
+        and is the most data-rich GPU in the pipeline. External data adds
+        nothing meaningful.
+
+IMPACT BY SEGMENT:
+    Datacenter GPUs (26): mean TVR change -0.092, CI width improved -0.074
+    Workstation GPUs (11): mean TVR change -0.009, CI width improved -0.023
+    Consumer GPUs (19): mean TVR change -0.011, CI width improved -0.004
+
+The external data disproportionately improves datacenter GPU projections,
+which is exactly where the pipeline was weakest. Consumer GPUs, which already
+had extensive Keepa coverage, see minimal change.
+
+CONCLUSION: The Keepa historical extension and webscraping supplement together
+produce a mean absolute TVR revision of 0.076 across all GPUs, concentrated
+in the datacenter segment where 15 GPUs see changes exceeding 0.10. For the
+commercially most important GPUs (H100, H200), the revisions are substantial
+(10-64% downward). The data should be considered a material improvement to
+the pipeline's datacenter GPU coverage.
+
+
+18a. DATA QUALITY IMPROVEMENTS (SINCE INITIAL RELEASE)
+
+The following data quality improvements were made to the pipeline:
+
+  V100 FHHL aliasing: The Tesla V100 FHHL (low-profile PCIe form factor,
+  same GV100 die) is aliased to Tesla V100 PCIe 16 GB via GPU_NAME_ALIASES
+  to consolidate what is the same product under one price history.
+
+  SXM carrier cost: Used V100 SXM2 bare modules (sold without the carrier
+  board needed for server installation) receive a $200 carrier cost
+  adjustment (CARRIER_COST = 200) to reflect the "usable equivalent"
+  price. Without this, bare SXM2 modules artificially deflate the V100
+  depreciation floor.
+
+  US-only filter: The retail CSVs contain multi-country data with prices in
+  local currency mislabeled as USD. Non-US datacenter GPU prices are 2-5x
+  US levels. Filtering to US-only reduces the dataset from ~580K to ~158K
+  rows. Keepa data is already US-only.
+
+  Title-based junk filter: 12 junk keywords (e.g. "as is", "for parts",
+  "defective"), 6 accessory keywords (e.g. "riser cable", "gpu holder"),
+  and 4 server bundle keywords (e.g. "dgx", "server node", "4x a100")
+  remove non-GPU products and multi-GPU bundles from the dataset.
+
+  Keepa renewed/refurbished product filter and max age filter (72 months).
+
+  Age-tiered USED price caps: 24-48 months: 1.5x MSRP, 48-72 months:
+  0.75x MSRP, 72+ months: 0.50x MSRP. Removes server bundles and
+  mislabeled form factors (SXM4 sold as "PCIe") from used data.
+
+  NEW fallback requires >= 3 distinct monthly periods per GPU. Prevents a
+  single stale Amazon listing repeated across months from creating phantom
+  data.
+
+  Supplement prediction/estimate row filter: rows from other pricing models
+  (e.g. "estimate", "age-based", "consensus") are excluded to prevent
+  circular dependency.
+
+  Outlier floor lowered from $200 to $50 so cheap consumer GPUs can show
+  realistic depreciation below 67% of MSRP.
+
+  MSRP corrections: L4 = $2,500 (was $7,000 OEM bundle), A40 = $5,000
+  (was $27,500 Cisco GPL OEM), L40 = $7,500 (was $31,000 OEM),
+  A16 = $2,800 (was $9,558 SHI reseller OEM).
+
+
+18a-ii. SUPPLEMENTARY DATA ACQUISITION SCRIPTS
+
+  scrape_ebay_sold.py: Scrapes eBay completed/sold listings for 15
+  thin-data datacenter GPUs (H100, H200, MI300X, Gaudi2, etc.). Extracts
+  title, price, condition, date, and confidence flag. Filters accessories,
+  multi-GPU systems, and prices outside 5-300% MSRP.
+  Output: data/ebay_verified_supplement.csv.
+
+  scrape_vastai.py: Queries Vast.ai public API for current GPU rental
+  pricing. Converts hourly rates to implied 3-year asset values
+  (median_hourly × 8,760 hrs × 3 yrs × 0.5 utilisation).
+  Output: data/vastai_pricing.csv.
+
+  extract_cloud_pricing.py: Processes historical cloud GPU pricing database
+  (2015-2024) into monthly rental rate time series. Maps cloud provider
+  GPU names to standardised GPU names.
+  Output: data/cloud_pricing_monthly.csv.
+
+  scrape_techpowerup.py: Cross-checks MSRP_REFERENCE and LAUNCH_DATES
+  constants against TechPowerUp GPU database for 24 GPUs.
+  Output: data/techpowerup_specs.csv.
+
+  bloomberg_pull.py: One-time Bloomberg Terminal data export (requires
+  Bloomberg Terminal with blpapi). Fetches historical data via
+  HistoricalDataRequest for cloud capex, crypto prices, etc.
+  Output: Desktop/bloomberg_gpu_data/*.csv.
+
+
+18b. BUG FIXES AND CHART IMPROVEMENTS
+
+  Bug fixes:
+  - Boundary-hit detection (quality gate 3) prevents degenerate Tier 1 fits
+    where parameters are pinned at bounds.
+  - A40 inverted curve fix: fl_eff = min(fl_c, anchor_value) prevents the
+    effective floor from exceeding the anchor when anchor < floor.
+  - Monotonicity backward clamp after t=60 overwrite prevents earlier curve
+    values from falling below the target.
+  - Return-value mismatch in make_smooth_curve fixed.
+  - +1 sigma line capped at 1.0 in individual charts.
+  - Family curves model clipped to CI band.
+
+  Chart improvements:
+  - PCHIP interpolation replaced CubicSpline (monotonic, no overshoot).
+  - Single smooth curve from 0-120 months (no splice kink).
+  - TVR arrow targets the actual curve value at t=60 (not a fixed point).
+  - Dynamic text placement for TVR annotation.
+  - +/-2 sigma shaded band (symmetric, model-centred) in individual charts.
+  - Smoothed CI boundaries in family charts (uniform_filter1d).
+  - P(below 10%) shown to 5 decimal places.
+
+
+18c. HIERARCHICAL BAYESIAN MODEL (SUPPLEMENTARY)
+
+hierarchical_bayes.py implements a PyMC-based hierarchical model as a
+supplementary validation of the primary scipy pipeline. The model places
+segment-level hyperpriors on the decay parameters (k, floor) and allows
+GPU-level partial pooling via:
+
+    k_segment ~ HalfNormal(sigma_k)
+    floor_segment ~ Beta(alpha_floor, beta_floor)
+    k_gpu ~ Normal(k_segment, sigma_k_gpu)
+    floor_gpu ~ Normal(floor_segment, sigma_floor_gpu)
+
+Key results:
+  - 0.948 Pearson correlation with scipy pipeline TVR estimates.
+  - Better estimates for sparse-data GPUs (e.g., MI300X, GH200) where
+    partial pooling produces more informative posteriors than the Tier 3
+    segment default.
+  - The hierarchical model naturally handles the "borrowing strength"
+    problem that the empirical Bayes prior addresses for Tier 2 GPUs.
+  - Results available in outputs/hierarchical_bayes_results.csv.
+
+
+18d. MONTE CARLO VALIDATION
+
+mc_convergence_test.py validates MC sample size adequacy by comparing 2,000
+vs 10,000 samples on five representative GPUs (one per fitting pathway:
+Tier 1 fitted, Tier 1 observed, Tier 2 constrained, Tier 3 default, and
+demand-shocked). It measures the coefficient of variation of CI percentiles
+across ten runs with different random seeds. Result: 10,000 samples produce
+stable CI estimates (CV < 1% for all CI boundaries).
+
+test_mc_symmetry.py tests whether the MC posterior predictive is
+approximately symmetric in log-space (justifying the normal approximation
+for uncertainty bands). For each test GPU at each time point
+(t = 0, 12, 24, 36, 48, 60), it compares level-space vs log-space
+skewness and CI arm asymmetry. The test monkey-patches _mc_to_stats()
+to intercept the raw MC arrays for ~10 representative GPUs.
+
+
+18d-ii. SENSITIVITY ANALYSIS (sensitivity_analysis.py)
+
+sensitivity_analysis.py varies four key pipeline thresholds one at a time
+and measures how much the depreciation rankings change. It monkey-patches
+module constants before each run and restores defaults afterward.
+
+Thresholds tested:
+
+    TIER1_MIN_MONTHS:    [12, 15, 18, 21, 24]    (default: 18)
+    OBS_WINDOW:          [6, 9, 12, 15, 18]       (default: 12)
+    APPRECIATING_THR:    [1.05, 1.1, 1.2, 1.5, 2.0]  (default: 1.2)
+    TIER1_MAX_MIN_AGE:   [18, 24, 30, 36, 42]     (default: 30)
+
+For each scenario, the full pipeline (fit_all_gpus + build_ranking) is
+rerun and the resulting rank vector is compared to the baseline using
+Spearman rank correlation and maximum/mean rank shift. Result: Spearman
+rho > 0.965 across all tested scenarios. Output: outputs/sensitivity_analysis.csv.
+
+
+18e. POWERPOINT DECK GENERATION
+
+make_deck.py produces a PowerPoint presentation with:
+  - Title slide
+  - One slide per datacenter GPU (sorted by TVR ascending, worst first)
+  - Family chart slides (Tesla V100, A100, H100, RTX 30/40-series, etc.)
+  - Segment overview slides (DATACENTER, WORKSTATION, CONSUMER)
+
+Each per-GPU slide shows: GPU name, MSRP, TVR, 5-year residual value ($),
+percentage loss, total data points, and data sources. Slide dimensions are
+13.333" × 7.5" (widescreen). Output: outputs/datacenter_gpu_deck.pptx.
+
+
+19. COMPLETE 5-YEAR DEPRECIATION RESULTS — ALL GPUs
+
+Each GPU is shown with its projected 5-year depreciation from the current
+pipeline run. TVR is the projected price as a fraction of launch MSRP at
+the 5-year mark. The 95% CI is the HPD range of the Monte Carlo projection.
+sigma is the standard deviation of 10,000 MC draws (higher = less certain).
+conf is the confidence flag: HIGH (tight CI, long history), MEDIUM, or LOW.
+P(below 10%) is shown at 5yr/8yr/10yr where available.
+
+Sorted within each segment by TVR ascending (worst retention first).
+
+Note on MSRP corrections since last version: L4 = $2,500 (was $7,000),
+A40 = $5,000 (was $27,500), L40 = $7,500 (was $31,000), A16 = $2,800
+(was $9,558). All corrected from OEM bundle prices to standalone GPU prices.
+
+
+DATACENTER GPUs (28)
+────────────────────
+
+  NVIDIA GH200 ($30,000)  [NEW fallback]
+    Tier 3 (segment_default), n=3 months, age 25-28 months
+    TVR: 0.124  sigma: 0.067  95% CI: [0.037, 0.270]  conf: MEDIUM  P(<10%): 0.32610/0.80490/0.91250
+
+  A16 PCIe ($2,800)
+    Tier 2 (constrained), n=11 months, age 41-57 months
+    TVR: 0.153  sigma: 0.093  95% CI: [0.033, 0.360]  conf: MEDIUM  P(<10%): 0.23750/0.58370/0.67420
+
+  Tesla V100 SXM2 16 GB ($8,999)
+    Tier 2 (constrained), n=18 months, age 85-101 months
+    TVR: 0.218  sigma: 0.111  95% CI: [0.058, 0.452]  conf: LOW  P(<10%): 0.05640/0.39580/0.58370
+
+  Tesla V100 SXM2 32 GB ($10,664)
+    Tier 2 (constrained), n=18 months, age 76-92 months
+    TVR: 0.226  sigma: 0.122  95% CI: [0.066, 0.501]  conf: LOW  P(<10%): 0.04920/0.45740/0.66910
+
+  Tesla V100 FHHL ($8,999)
+    Tier 3 (segment_default), n=1 months, age 76-76 months
+    TVR: 0.234  sigma: 0.128  95% CI: [0.067, 0.515]  conf: LOW  P(<10%): 0.03970/0.46190/0.69900
+
+  H200 NVL ($32,000)  [NEW fallback]
+    Tier 3 (segment_default), n=0 months
+    TVR: 0.236  sigma: 0.130  95% CI: [0.068, 0.525]  conf: LOW  P(<10%): 0.03700/0.45280/0.69480
+
+  H100 SXM5 64 GB ($25,000)
+    Tier 2 (constrained), n=6 months, age 30-36 months
+    TVR: 0.267  sigma: 0.142  95% CI: [0.057, 0.559]  conf: LOW  P(<10%): 0.04920/0.29590/0.39800
+
+  Radeon Instinct MI210 ($15,000)
+    Tier 2 (constrained), n=5 months, age 49-52 months
+    TVR: 0.285  sigma: 0.131  95% CI: [0.070, 0.553]  conf: LOW  P(<10%): 0.03420/0.18640/0.25430
+
+  Tesla V100 PCIe 32 GB ($10,664)
+    Tier 2 (constrained), n=22 months, age 76-96 months
+    TVR: 0.301  sigma: 0.141  95% CI: [0.096, 0.607]  conf: LOW  P(<10%): 0.01070/0.16550/0.29910
+
+  Tesla V100 PCIe 16 GB ($8,999)
+    Tier 2 (constrained), n=22 months, age 85-105 months
+    TVR: 0.308  sigma: 0.148  95% CI: [0.104, 0.639]  conf: LOW  P(<10%): 0.00760/0.15830/0.30670
+
+  Gaudi2 HL-225H ($15,000)
+    Tier 3 (segment_default), n=2 months, age 18-30 months
+    TVR: 0.319  sigma: 0.174  95% CI: [0.101, 0.717]  conf: LOW  P(<10%): 0.00720/0.27910/0.54370
+
+  A100 SXM4 80 GB ($15,000)
+    Tier 2 (constrained), n=18 months, age 26-52 months
+    TVR: 0.332  sigma: 0.129  95% CI: [0.091, 0.586]  conf: LOW  P(<10%): 0.01810/0.06910/0.09360
+
+  A100 SXM4 40 GB ($11,000)
+    Tier 1 (observed), n=15 months, age 51-70 months
+    TVR: 0.334  sigma: 0.077  95% CI: [0.201, 0.421]  conf: MEDIUM  P(<10%): 0.00000
+
+  AMD Instinct MI300X ($15,000)
+    Tier 3 (segment_default), n=1 months, age 20-20 months
+    TVR: 0.453  sigma: 0.243  95% CI: [0.122, 0.967]  conf: LOW  P(<10%): 0.00100/0.11560/0.34270
+
+  Tesla V100S PCIe 32 GB ($10,664)
+    Tier 1 (observed), n=19 months, age 56-75 months
+    TVR: 0.457  sigma: 0.124  95% CI: [0.189, 0.526]  conf: LOW  P(<10%): 0.00000
+
+  H100 PCIe 80 GB ($25,599)  [NEW fallback]
+    Tier 3 (segment_default), n=3 months, age 21-22 months
+    TVR: 0.542  sigma: 0.271  95% CI: [0.179, 1.135]  conf: LOW  P(<10%): 0.00020/0.06210/0.23860
+
+  A100 PCIe 40 GB ($11,000)
+    Tier 1 (observed), n=6 months, age 49-65 months
+    TVR: 0.568  sigma: 0.095  95% CI: [0.495, 0.714]  conf: LOW  P(<10%): 0.00000
+
+  H100 SXM5 80 GB ($30,000)
+    Tier 2 (constrained), n=24 months, age 0-36 months
+    TVR: 0.588  sigma: 0.198  95% CI: [0.233, 0.992]  conf: LOW  P(<10%): 0.00100/0.00750/0.01140
+
+  A30 PCIe ($4,500)
+    Tier 1 (observed), n=21 months, age 39-59 months
+    TVR: 0.654  sigma: 0.109  95% CI: [0.444, 0.732]  conf: MEDIUM  P(<10%): 0.00000
+
+  A100 PCIe 80 GB ($13,000)
+    Tier 2 (constrained), n=21 months, age 32-51 months
+    TVR: 0.683  sigma: 0.163  95% CI: [0.364, 0.992]  conf: LOW  P(<10%): 0.00010/0.00010/0.00010
+
+  A10 ($3,500)
+    Tier 1 (observed), n=21 months, age 39-59 months
+    TVR: 0.686  sigma: 0.112  95% CI: [0.665, 0.972]  conf: LOW  P(<10%): 0.00000
+
+  A100X ($15,000)
+    Tier 2 (constrained), n=7 months, age 34-43 months
+    TVR: 0.692  sigma: 0.248  95% CI: [0.227, 1.194]  conf: LOW  P(<10%): 0.00160/0.01460/0.02010
+
+  T4 ($2,299)
+    Tier 1 (fitted), n=27 months, age 6-90 months
+    TVR: 0.693  sigma: 0.086  95% CI: [0.508, 0.832]  conf: MEDIUM  P(<10%): 0.00000
+
+  H200 SXM ($35,000)  [NEW fallback]
+    Tier 2 (constrained), n=10 months, age 16-24 months
+    TVR: 0.732  sigma: 0.275  95% CI: [0.194, 1.255]  conf: LOW  P(<10%): 0.00090/0.01610/0.02450
+
+  H100 SXM5 94 GB ($33,000)  [NEW fallback]
+    Tier 2 (constrained), n=7 months, age 21-31 months
+    TVR: 0.839  sigma: 0.319  95% CI: [0.252, 1.472]  conf: LOW  P(<10%): 0.00110/0.01610/0.02500
+
+  L40S ($7,500)
+    Tier 2 (constrained), n=20 months, age 11-31 months
+    TVR: 0.873  sigma: 0.217  95% CI: [0.437, 1.283]  conf: LOW  P(<10%): 0.00020/0.00080/0.00130
+
+  L4 ($2,500)
+    Tier 2 (constrained), n=21 months, age 18-37 months
+    TVR: 1.056  sigma: 0.260  95% CI: [0.555, 1.574]  conf: LOW  P(<10%): 0.00010/0.00030/0.00060
+
+  L40 ($7,500)
+    Tier 2 (constrained), n=20 months, age 22-41 months
+    TVR: 1.121  sigma: 0.270  95% CI: [0.598, 1.646]  conf: LOW  P(<10%): 0.00000/0.00020/0.00020
+
+  A40 ($5,000)
+    Tier 2 (constrained), n=4 months, age 45-48 months
+    TVR: 1.156  sigma: 0.435  95% CI: [0.328, 2.000]  conf: LOW  P(<10%): 0.00020/0.01220/0.02370
+
+  H100 PCIe 94 GB ($28,000)
+    Tier 2 (constrained), n=14 months, age 17-36 months
+    TVR: 1.223  sigma: 0.318  95% CI: [0.569, 1.821]  conf: LOW  P(<10%): 0.00010/0.00060/0.00100
+
+
+WORKSTATION GPUs (11)
+─────────────────────
+
+  Quadro P5000 ($2,499)
+    Tier 2 (constrained), n=21 months, age 96-115 months
+    TVR: 0.318  sigma: 0.120  95% CI: [0.126, 0.578]  conf: LOW  P(<10%): 0.00290/0.09740/0.23920
+
+  Quadro RTX 6000 ($6,300)
+    Tier 2 (constrained), n=23 months, age 11-88 months
+    TVR: 0.328  sigma: 0.129  95% CI: [0.128, 0.609]  conf: LOW  P(<10%): 0.00400/0.11830/0.27430
+
+  Quadro RTX 4000 ($900)
+    Tier 2 (constrained), n=30 months, age 4-88 months
+    TVR: 0.375  sigma: 0.135  95% CI: [0.155, 0.667]  conf: LOW  P(<10%): 0.00150/0.05060/0.11940
+
+  RTX A2000 ($450)
+    Tier 1 (observed), n=22 months, age 39-59 months
+    TVR: 0.447  sigma: 0.159  95% CI: [0.228, 0.694]  conf: LOW  P(<10%): 0.00000
+
+  RTX A4000 ($1,000)
+    Tier 1 (observed), n=24 months, age 4-58 months
+    TVR: 0.469  sigma: 0.135  95% CI: [0.258, 0.664]  conf: LOW  P(<10%): 0.00000
+
+  Quadro RTX 5000 ($2,300)
+    Tier 2 (constrained), n=22 months, age 68-88 months
+    TVR: 0.500  sigma: 0.193  95% CI: [0.184, 0.903]  conf: LOW  P(<10%): 0.00030/0.03130/0.10780
+
+  RTX A5000 ($2,249)
+    Tier 1 (observed), n=22 months, age 39-59 months
+    TVR: 0.658  sigma: 0.179  95% CI: [0.249, 0.721]  conf: LOW  P(<10%): 0.00000
+
+  RTX A4500 ($2,249)
+    Tier 1 (observed), n=22 months, age 33-53 months
+    TVR: 0.685  sigma: 0.030  95% CI: [0.647, 0.692]  conf: HIGH  P(<10%): 0.00000
+
+  RTX 4000 Ada Generation ($1,250)
+    Tier 2 (constrained), n=21 months, age 19-38 months
+    TVR: 0.888  sigma: 0.280  95% CI: [0.373, 1.451]  conf: LOW  P(<10%): 0.00000/0.00260/0.00690
+
+  RTX A6000 ($4,650)
+    Tier 2 (constrained), n=5 months, age 45-48 months
+    TVR: 1.000  sigma: 0.306  95% CI: [0.442, 1.619]  conf: LOW  P(<10%): 0.00010/0.00150/0.00380
+
+  RTX 6000 Ada Generation ($6,800)
+    Tier 2 (constrained), n=22 months, age 19-39 months
+    TVR: 1.131  sigma: 0.353  95% CI: [0.501, 1.880]  conf: LOW  P(<10%): 0.00000/0.00110/0.00460
+
+
+CONSUMER GPUs (20)
+──────────────────
+
+  GeForce RTX 4090 D ($1,599)
+    Tier 2 (constrained), n=7 months, age 11-17 months
+    TVR: 0.227  sigma: 0.034  95% CI: [0.176, 0.305]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 3080 Ti ($1,199)
+    Tier 1 (observed), n=24 months, age 10-57 months
+    TVR: 0.551  sigma: 0.033  95% CI: [0.485, 0.568]  conf: HIGH  P(<10%): 0.00000
+
+  GeForce RTX 4090 ($1,599)
+    Tier 2 (constrained), n=33 months, age 1-41 months
+    TVR: 0.608  sigma: 0.145  95% CI: [0.331, 0.892]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 3070 Ti ($599)
+    Tier 1 (observed), n=24 months, age 10-57 months
+    TVR: 0.618  sigma: 0.030  95% CI: [0.601, 0.636]  conf: HIGH  P(<10%): 0.00000
+
+  GeForce RTX 3070 ($499)
+    Tier 1 (observed), n=22 months, age 45-65 months
+    TVR: 0.628  sigma: 0.030  95% CI: [0.583, 0.669]  conf: HIGH  P(<10%): 0.00000
+
+  GeForce RTX 3060 ($329)
+    Tier 1 (observed), n=22 months, age 41-61 months
+    TVR: 0.631  sigma: 0.110  95% CI: [0.414, 0.700]  conf: MEDIUM  P(<10%): 0.00000
+
+  GeForce RTX 3080 ($699)
+    Tier 1 (observed), n=25 months, age 1-66 months
+    TVR: 0.644  sigma: 0.030  95% CI: [0.589, 0.678]  conf: HIGH  P(<10%): 0.00000
+
+  GeForce RTX 3060 Ti ($399)
+    Tier 1 (observed), n=22 months, age 43-63 months
+    TVR: 0.649  sigma: 0.030  95% CI: [0.590, 0.671]  conf: HIGH  P(<10%): 0.00000
+
+  GeForce RTX 3090 Ti ($1,999)
+    Tier 1 (fitted), n=33 months, age 1-48 months
+    TVR: 0.781  sigma: 0.068  95% CI: [0.658, 0.893]  conf: MEDIUM  P(<10%): 0.00000
+
+  GeForce RTX 4060 Ti 8 GB ($399)
+    Tier 2 (constrained), n=32 months, age 2-34 months
+    TVR: 0.793  sigma: 0.192  95% CI: [0.417, 1.153]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 3090 ($1,499)
+    Tier 1 (fitted), n=24 months, age 3-66 months
+    TVR: 0.814  sigma: 0.055  95% CI: [0.708, 0.908]  conf: MEDIUM  P(<10%): 0.00000
+
+  GeForce RTX 4070 SUPER ($599)
+    Tier 2 (constrained), n=27 months, age 0-26 months
+    TVR: 0.883  sigma: 0.206  95% CI: [0.509, 1.305]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4070 Ti ($799)
+    Tier 2 (constrained), n=34 months, age 0-38 months
+    TVR: 0.919  sigma: 0.220  95% CI: [0.503, 1.349]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4060 ($299)
+    Tier 2 (constrained), n=32 months, age 2-33 months
+    TVR: 0.936  sigma: 0.226  95% CI: [0.522, 1.398]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4070 ($599)
+    Tier 2 (constrained), n=29 months, age 5-35 months
+    TVR: 0.960  sigma: 0.225  95% CI: [0.535, 1.409]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4080 SUPER ($999)
+    Tier 2 (constrained), n=26 months, age 0-26 months
+    TVR: 0.996  sigma: 0.231  95% CI: [0.562, 1.462]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4070 Ti SUPER ($799)
+    Tier 2 (constrained), n=26 months, age 0-25 months
+    TVR: 1.001  sigma: 0.233  95% CI: [0.558, 1.468]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4060 Ti 16 GB ($499)
+    Tier 2 (constrained), n=30 months, age 0-32 months
+    TVR: 1.064  sigma: 0.252  95% CI: [0.603, 1.585]  conf: LOW  P(<10%): 0.00000
+
+  GeForce RTX 4080 ($1,199)
+    Tier 2 (constrained), n=32 months, age 0-40 months
+    TVR: 1.159  sigma: 0.276  95% CI: [0.622, 1.694]  conf: LOW  P(<10%): 0.00000
+
+  Note: 20 consumer GPUs (GeForce RTX 4090 D now included). The condition
+  switch methodology uses NEW data for months 0-24, then switches to
+  REFURBISHED/USED data for months 24+. Age-tiered USED price caps
+  (24-48mo: 1.5x, 48-72mo: 0.75x, 72+mo: 0.50x MSRP) filter server
+  bundles and mislabeled products. The RTX 30-series GPUs show significant
+  depreciation now that used/refurbished data drives the post-24-month
+  trajectory.
+
+
+HOW TO READ THESE RESULTS
+
+TVR is the fraction of the original price you get back after 5 years.
+
+  TVR 0.15  =  you lose 85% of what you paid  ($30,000 GPU worth $4,500)
+  TVR 0.50  =  you lose 50%                   ($30,000 GPU worth $15,000)
+  TVR 0.85  =  you lose 15%                   ($30,000 GPU worth $25,500)
+  TVR 1.00  =  you break even
+  TVR 1.15  =  the GPU appreciated 15%        ($30,000 GPU worth $34,500)
+
+To calculate expected dollar loss for any GPU:
+
+  Dollar loss = MSRP x (1 - TVR)
+
+  Example: H100 SXM5 64 GB at TVR 0.267
+           $25,000 x (1 - 0.267) = $25,000 x 0.733 = ~$18,325 lost
+
+The 95% CI (HPD interval) gives you the range. For that same H100 SXM5 64:
+  Best case (CI high = 0.559):  lose $11,025 (retain $13,975)
+  Expected (TVR = 0.267):       lose $18,325 (retain $6,675)
+  Worst case (CI low = 0.057):  lose $23,575 (retain $1,425)
+
+sigma tells you how spread out the projection is. Think of it as:
+  sigma < 0.05:   very tight -- trust the number
+  sigma 0.05-0.15: moderate spread -- directionally reliable
+  sigma 0.15-0.30: wide spread -- use for rough planning only
+  sigma > 0.30:    extremely uncertain -- treat as a guess
+
+GPUs with TVR above 1.0 are currently trading above their launch MSRP.
+This is unusual and reflects AI-driven demand. These values will almost
+certainly decline as supply normalises -- do not treat TVR > 1.0 as a
+reliable long-term forecast.

@@ -1,0 +1,763 @@
+================================================================================
+  GPU DEPRECIATION & REFURBISHMENT PREMIUM ANALYSIS — MATHEMATICAL OVERVIEW
+================================================================================
+
+This document covers the mathematical foundations for the GPU pricing analysis
+pipeline. The full execution order is:
+
+    keepa_prep.py → depreciation_curves.py → ranking.py
+    → sensitivity_analysis.py → generate_curves.py → generate_family_curves.py
+    → make_deck.py
+
+Library modules: data_prep.py (data loading/cleaning, MSRP/launch date
+constants). Independent scripts: refurb_premium.py (refurbishment premium
+analysis), hierarchical_bayes.py (PyMC supplementary validation). Data
+acquisition scrapers: scrape_ebay_sold.py, scrape_techpowerup.py,
+scrape_vastai.py, extract_cloud_pricing.py. Bloomberg Terminal export:
+bloomberg_pull.py (one-time data export for cloud capex, crypto, etc.;
+requires Bloomberg Terminal). Test scripts: mc_convergence_test.py,
+test_mc_symmetry.py. generate_curves.py and generate_family_curves.py
+produce visualization outputs. make_deck.py produces a PowerPoint deck
+(outputs/datacenter_gpu_deck.pptx).
+
+The two primary goals are:
+
+  (1) Statistically prove that a "refurbishment premium" exists, meaning
+      REFURBISHED units command systematically higher prices than USED units.
+
+  (2) Rank GPU models by worst 5-year depreciation, extrapolated from
+      observed price history extended by Keepa/Amazon data.
+
+Columns in the dataset: date, gpu_name, condition, msrp, fp32, price_usd.
+
+
+================================================================================
+  1. DATA PREPARATION MATH
+================================================================================
+
+  1.1 MSRP Canonicalisation
+  --------------------------
+  Per-row MSRP values can vary up to 5–10% across CSVs due to scraping
+  inconsistency (and reseller markups on datacenter GPUs can be 2–3x).
+  A canonical MSRP is computed per GPU using MSRP_REFERENCE (a curated
+  table of official NVIDIA/AMD launch prices) as the primary source,
+  with the CSV median as a fallback for GPUs not in the reference table:
+
+      msrp_canonical_k = MSRP_REFERENCE[k]  if k in MSRP_REFERENCE
+                       = median( msrp_i  for all i with gpu_name = k )  otherwise
+
+  All price_ratio computations use msrp_canonical, eliminating spurious
+  cross-row variation from MSRP scraping noise and reseller markups.
+
+  An integrity check flags any GPU where:
+
+      (msrp_max - msrp_min) / msrp_min  >  0.05
+
+  1.2 Price Ratio Normalisation
+  ------------------------------
+  Raw prices are not directly comparable across GPU tiers. Normalise by
+  canonical MSRP:
+
+      price_ratio_i = price_usd_i / msrp_canonical_k(i)
+
+  This yields a dimensionless scalar where 1.0 = full MSRP at launch.
+  All curve fitting and ranking operate on price_ratio.
+
+  1.3 Launch-Date Time Origin
+  ----------------------------
+  All timing uses official GPU launch date as t = 0 (sourced from TechPowerUp):
+
+      age_months_i = (date_i - launch_date_k(i)).days / 30.44
+
+  GPUs with no known launch date are flagged `left_censored = True` and
+  excluded from curve fitting.
+
+  1.4 GPU Name Aliasing and Carrier Cost Adjustment
+  ---------------------------------------------------
+  The Tesla V100 FHHL (low-profile PCIe form factor, same GV100 die) is
+  aliased to Tesla V100 PCIe 16 GB via GPU_NAME_ALIASES to consolidate
+  what is the same product's price history under one name.
+
+  For USED V100 SXM2 bare modules (sold without the carrier board needed
+  for server installation), a $200 carrier cost (CARRIER_COST) is added:
+
+      price_usd_adj = price_usd + 200    if condition=USED and gpu is V100 SXM2
+
+  This reflects the "usable equivalent" price and prevents bare modules
+  from artificially deflating the V100's depreciation floor.
+
+  1.5 Demand-Shock Detection
+  ---------------------------
+  A GPU is flagged `demand_shock = True` if, in the last 90 days, the
+  median NEW price_ratio exceeds 1.5 AND there are at least 3 observations:
+
+      shock = ( median( price_ratio | condition=NEW, date in last 90 days ) > 1.5 )
+              AND ( n_obs >= 3 )
+
+  The minimum-observations guard (SHOCK_MIN_SAMPLES = 3) prevents a single
+  anomalous listing from triggering the flag. Demand-shock GPUs are included
+  in the main depreciation ranking but flagged separately with additional
+  scenario analysis.
+
+  1.6 Temporal Aggregation
+  -------------------------
+  Within each (gpu_name, month), multiple observations are reduced to their
+  median price_ratio. The median is preferred over the mean because:
+    - GPU prices are right-skewed.
+    - Median is robust to up to 50% outlier contamination.
+    - It is insensitive to the exact outlier filter threshold.
+
+
+================================================================================
+  2. REFURBISHMENT PREMIUM — STATISTICAL PROOF
+================================================================================
+
+  2.1 Confirmatory OLS (Primary Test)
+  -------------------------------------
+  The primary test uses log price with GPU and time fixed effects.
+  Aggregate to monthly medians per (gpu_name, condition, year_month) first
+  to avoid pseudo-replication. USED is the reference condition.
+
+  Model:
+      log(price_usd_i) = beta_0 + delta_R * D_REFURB_i
+                       + sum_k(gamma_k * GPU_k_i)
+                       + sum_j(lambda_j * Month_j_i)
+                       + epsilon_i
+
+  Interpretation:
+    - delta_R:  log-scale premium of REFURBISHED over USED, controlling for
+                GPU identity and time period.
+    - exp(delta_R) - 1:  percentage premium in price terms.
+
+  Standard errors are cluster-robust by GPU (cov_type="cluster",
+  groups=gpu_name) to account for within-GPU temporal autocorrelation.
+
+  When a "country" column is present in the dataset, the OLS includes a
+  country fixed effect:
+
+      log(price_usd_i) = beta_0 + delta_R * D_REFURB_i
+                       + sum_k(gamma_k * GPU_k_i)
+                       + sum_j(lambda_j * Month_j_i)
+                       + sum_c(phi_c * Country_c_i)
+                       + epsilon_i
+
+  The C(country) term controls for systematic cross-country price
+  differences (e.g. VAT regimes, shipping, local supply/demand) that
+  would otherwise be absorbed into the condition coefficient. This
+  ensures delta_R reflects a within-country refurbishment premium rather
+  than a premium confounded by geographic price variation. Aggregation
+  to monthly medians is performed per (gpu_name, condition, year_month,
+  country) when country data is available.
+
+  2.2 Cluster Bootstrap CI (Robustness Check)
+  ---------------------------------------------
+  Resample GPU models with replacement (not rows) to preserve within-GPU
+  temporal dependence. For each bootstrap sample:
+
+      premium^(b) = ( median_REFURB^(b) - median_USED^(b) ) / median_USED^(b) * 100
+
+  Repeat B = 2000 times. The 95% CI is [ F^{-1}(0.025), F^{-1}(0.975) ]
+  of the B bootstrap estimates. This is a GPU-level cluster bootstrap — it
+  captures between-GPU heterogeneity in the premium, not just within-GPU
+  variance.
+
+  2.3 Per-GPU t-Tests with B-H FDR Correction (Exploratory)
+  -----------------------------------------------------------
+  For each GPU with >= 3 observations in both REFURBISHED and USED:
+
+  (a) Power analysis: compute minimum detectable effect size (Cohen's d) at
+      power = 0.80, alpha = 0.05. Skip GPU if MDE > 0.30 (underpowered cell).
+
+  (b) Welch's t-test:  t, p_raw = ttest_ind(REFURB, USED, equal_var=False)
+
+  (c) Cohen's d = ( mean_R - mean_U ) / s_pooled
+
+  Apply Benjamini-Hochberg FDR correction at q = 0.10 across all per-GPU
+  p-values. Report corrected p-values; label findings as exploratory.
+
+  Verdict logic (2-tier, driven by the confirmatory OLS test only):
+    CONFIRMED:     OLS p < 0.05
+    NOT CONFIRMED: OLS p >= 0.05
+
+  The bootstrap is reported as a robustness check (it estimates a different
+  quantity — the unconditional median-of-medians premium), not as a
+  co-decision gate.
+
+  2.4 Cohen's d — Effect Size
+  ----------------------------
+      d = (mean_R - mean_U) / s_pooled
+
+  where  s_pooled = sqrt( [ (n_R-1)*s_R^2 + (n_U-1)*s_U^2 ] / (n_R+n_U-2) )
+
+  Conventional benchmarks: 0.2 small, 0.5 medium, 0.8 large.
+
+
+================================================================================
+  3. DEPRECIATION CURVE FITTING
+================================================================================
+
+  3.1 Exponential Decay with Floor
+  ----------------------------------
+  Primary model. At t = 0, P = 1.0 (GPU launches at MSRP, by construction).
+
+      P(t) = floor + (1 - floor) * exp(-k * t)
+
+  Parameters:
+    - floor in [0.001, 0.80] — asymptotic residual value as fraction of MSRP.
+    - k     in [0.005, 0.25] — monthly decay rate.
+
+  Bounds rationale:
+    k = 0.005 → half-life ~138 months (~11 years, essentially flat)
+    k = 0.25  → half-life ~2.8 months (fastest plausible GPU decline)
+    Previous bounds [1e-4, 1.0] allowed unphysical 579-year and sub-1-month
+    half-lives; tightened to [0.005, 0.25] to constrain physically implausible
+    solutions.
+
+  Half-life (months until P = 0.5):
+    t_{1/2} = -ln( (0.5 - floor) / (1 - floor) ) / k
+    Only defined when floor < 0.5; returns NaN otherwise.
+
+  3.2 Power Law with Floor (Reparameterised)
+  -------------------------------------------
+  Captures slower initial decline and a longer tail. Reparameterised to
+  enforce P(0) = 1.0 exactly:
+
+      P(t) = floor + (1 - floor) * (t + 1)^(-b)
+
+  Parameters:
+    - floor in [0.001, 0.80]
+    - b     in [0.01, 3.0] — decay exponent
+
+  The reparameterisation sets the amplitude a = (1 - floor), eliminating
+  the original free parameter 'a' and the associated t=0 constraint
+  violation (the old form floor + a*(t+1)^(-b) allowed P(0) = floor + a,
+  which could exceed MSRP).
+
+  Half-life (months until P = 0.5):
+    t_{1/2} = ((0.5 - floor) / (1 - floor))^(-1/b) - 1
+    Only defined when floor < 0.5 and b > 0.
+
+  Note: there is no hybrid/sigmoid blend model. The ensemble is strictly
+  a weighted average of exp_floor and power_floor.
+
+  3.3 Proportional Error Weighting in Fitting
+  --------------------------------------------
+  scipy.optimize.curve_fit is called with sigma = max(y_i, 0.05), i.e.
+  proportional (relative-error) weighting:
+
+      Objective: min sum_i [ (y_i - f(t_i; theta)) / max(y_i, 0.05) ]^2
+
+  Rationale: GPU price data is multiplicative — a 10% error at 0.20 MSRP
+  is equivalent to a 10% error at 0.80 MSRP. Unweighted least squares
+  assigns proportionally more weight to high-ratio observations, biasing
+  fits toward the early high-price window and underweighting the floor.
+  Proportional weighting produces approximately homoskedastic residuals
+  across the full price range.
+
+  Consistency: R² and AICc are both computed in the same proportional-error
+  space, ensuring the fitting objective and model selection criterion are
+  aligned.
+
+  3.4 R² in Proportional-Error Space
+  ------------------------------------
+  After fitting, R² measures the fraction of weighted variance explained:
+
+      ss_res_w = sum_i [ (y_i - y_hat_i) / sigma_i ]^2
+      ss_tot_w = sum_i [ (y_i - y_bar  ) / sigma_i ]^2
+      R^2 = 1 - ss_res_w / ss_tot_w
+
+  This is the proportional-error R², consistent with the weighted objective.
+  It is not equivalent to the standard unweighted R².
+
+  3.5 AICc (Corrected AIC) for Model Selection
+  ----------------------------------------------
+  Standard AIC underpenalises complexity at small n. AICc (Hurvich & Tsai
+  1989; Burnham & Anderson 2002 §2.3) adds an exact correction:
+
+      k_eff = k                (curve params only; sigma is NOT estimated)
+      AICc  = SS_res_w + 2*k_eff + 2*k_eff*(k_eff+1)/(n-k_eff-1)
+
+  where SS_res_w is the weighted residual sum of squares.
+
+  sigma_i = max(y_i, 0.05) are treated as known proportional weights
+  (absolute_sigma=False in curve_fit). Under known heteroskedastic weights,
+  -2*logL ∝ SS_res_w and sigma² is not a free parameter, so k_eff = k only.
+  The Σlog(2πσ_i²) constant cancels in ΔAICc between models sharing the
+  same data.
+
+  3.6 Akaike Ensemble Weights
+  ----------------------------
+  Models with R² < 0.20 are dropped from the ensemble before computing
+  weights. If both models fail this gate, the GPU falls through to Tier 2.
+  For models that pass:
+
+      delta_i = AICc_i - min_j(AICc_j)
+      w_i     = exp(-0.5 * delta_i) / sum_j exp(-0.5 * delta_j)
+
+  The final projection blends both models proportionally to relative evidence.
+  Weights are data-driven, not fixed.
+
+
+================================================================================
+  4. THREE-TIER HIERARCHICAL FITTING
+================================================================================
+
+  4.0 Condition Switch
+  ---------------------
+  Before curve fitting, the pipeline selects observations by condition
+  based on the GPU's age at observation time:
+
+      condition_used(t) = NEW                    if t <= 24
+                        = REFURBISHED or USED    if t > 24
+
+  For the first 24 months (t <= 24), only NEW-condition observations enter
+  the fitting pipeline. After month 24 (t > 24), the pipeline switches to
+  REFURBISHED and USED condition data. This two-phase selection reflects
+  the market lifecycle: new-condition units dominate early secondary-market
+  transactions, while refurbished and used units become the primary
+  transaction type as hardware ages past two years.
+
+  Fallback rule: six GPUs currently have no refurbished/used data available:
+    - H100 PCIe 80 GB
+    - H100 SXM5 94 GB
+    - H200 SXM
+    - Gaudi2 HL-225H
+    - H200 NVL
+    - NVIDIA GH200
+
+  For these GPUs, the pipeline uses NEW-condition data as a fallback for
+  t > 24. This means their post-24-month trajectories reflect new-unit
+  pricing rather than secondary-market pricing, which may overstate
+  value retention. As refurbished/used listings accumulate, the fallback
+  will no longer be needed.
+
+  4.1 Extended Monthly Data
+  --------------------------
+  Retail CSV medians (Jun 2024+) and Keepa/Amazon monthly medians (pre-Jun
+  2024) are merged into a single time series per GPU. Retail is authoritative
+  for any overlapping month. price_ratio is capped at 1.5 (demand-shock
+  threshold) in both sources before fitting — this removes shock-driven
+  above-MSRP observations without discarding all history for GPUs that had
+  a temporary spike (e.g. RTX 30-series during the 2021 crypto boom).
+
+  4.2 Tier 1 — Individual Fit
+  ----------------------------
+  Requirements: >= 18 monthly observations AND first observation before
+  age 30 months. Fits both models; computes AICc-weighted ensemble.
+
+  Quality gates (both must pass to accept Tier 1):
+    Gate 1: best model R² >= 0.20 (model explains at least 20% of variance)
+    Gate 2: MC median at t=0 <= 1.5 (back-extrapolation does not imply an
+            implausible above-MSRP launch price)
+
+  If either gate fails, falls through to Tier 2.
+
+  4.3 Tier 2 — Segment-Constrained Fit
+  --------------------------------------
+  For sparse GPUs with >= 4 observations. Fix k from the segment canonical
+  fit (pooled exp_floor across well-observed GPUs in the same segment), then
+  fit floor as the only free parameter.
+
+  4.3a Empirical Bayes Floor Prior
+  ---------------------------------
+  For GPUs with sparse data (especially those that have not yet shown
+  visible depreciation, e.g. H100 at ages 17-35 months), the floor
+  estimate is regularised via a penalised weighted least squares (WLS)
+  objective that shrinks the estimate toward a segment-level prior.
+
+  The prior is computed from data-rich GPUs within the same segment:
+
+      S_rich = { GPU g in segment : max(age_months_g) >= 60 }
+
+  For each g in S_rich, the long-run floor estimate is the median
+  price_ratio in the latest 12 months of data. The segment prior
+  parameters are:
+
+      prior_mean = mean( floor_g  for g in S_rich )
+      prior_std  = max( std( floor_g  for g in S_rich ),  0.05 )
+
+  A minimum of 2 GPUs in S_rich is required; otherwise no prior is
+  applied and the fit proceeds without regularisation.
+
+  The penalised objective for a given GPU with data (t, y) is:
+
+      L(floor) = sum_i [ (y_i - f(t_i; floor, k_fixed)) / sigma_i ]^2
+                 + lambda * (floor - prior_mean)^2 / prior_var
+
+  where sigma_i = max(y_i, 0.05) (proportional weighting, as in Tier 1),
+  prior_var = prior_std^2, and the regularisation weight lambda is:
+
+      n_eff  = max(1, n_data_months)
+      lambda = max(0,  1 - n_eff / 36)
+
+  lambda fades linearly from 1.0 (full prior, n = 0) to 0.0 (fully
+  data-driven, n >= 36). This reflects the intuition that GPUs with
+  very short histories should borrow strength from the segment, while
+  GPUs with 3+ years of post-MSRP data can stand on their own.
+
+  The posterior variance blends likelihood and prior precisions, scaled
+  by lambda to match the penalised objective:
+
+      sigma_bar  = mean( max(y_i, 0.05) )
+      like_prec  = n / max(sigma_bar^2, 1e-4)
+      post_var   = 1 / (like_prec + lambda * prior_prec)
+
+  where prior_prec = 1 / prior_var. When lambda < 1, less prior
+  information was actually used, so the posterior variance is wider
+  than the full-prior case — correctly reflecting that only partial
+  regularisation was applied.
+
+  Monte Carlo samples [floor, k] jointly from a bivariate normal using the
+  cross-covariance from the canonical fit:
+
+      cov_2x2 = [[Var(floor),     Cov(floor,k)]
+                 [Cov(floor,k),   Var(k)      ]]
+
+  floor and k are structurally negatively correlated in exp_floor (higher k
+  → lower floor to reproduce the same data). Using the canonical cross-covariance
+  avoids the independent-sampling bias that inflates sigma_yr5 and
+  p_below_10pct when sampling floor and k independently.
+
+  k is clipped to [0.005, 0.25] and floor to [0.001, 0.80] after sampling.
+
+  4.3b Forward Projection — Conditional Scaling
+  -----------------------------------------------
+  After the constrained MC sampling produces the raw depreciation curve,
+  the projection is anchored at the GPU's current market price via
+  conditional scaling. Let P_obs be the most recent observed price_ratio
+  (no cap — if a GPU trades above MSRP, the forward projection starts
+  from that elevated level and decays from there) and P_model(t_obs) be
+  the model's value at the current age. The scale factor is:
+
+      scale = P_obs / P_model(t_obs)
+
+  clipped to [0.3, 2.5] (widened from [0.5, 2.0]). All MC samples are
+  multiplied by this scale, with +/-20% stochastic noise (uniform) added
+  to reflect uncertainty in the current observed price level.
+
+  This conditional forecasting ensures the 5-year projection starts from
+  the actual market level rather than re-simulating from a theoretical
+  launch price. The [0.3, 2.5] clip on scale prevents extreme
+  adjustments when P_model(t_obs) is near zero or when the observed
+  price deviates substantially from the segment-constrained fit.
+
+  4.4 Tier 3 — Segment Default
+  -----------------------------
+  For GPUs with < 4 observations or where all fits failed. Use the segment
+  canonical curve directly, scaled to the observed current level:
+
+      scale = current_ratio / canonical_curve(t_obs)
+      scale is clipped to [0.3, 2.5]
+
+  No cap is applied at t=0 — the curve is allowed to reflect above-MSRP
+  pricing when market data shows it.
+
+  k_s in the MC loop is clipped to [0.005, 0.25] to match Tier 1/2 bounds.
+
+  4.5 Special Case: Back-Extrapolation for Appreciating GPUs
+  -----------------------------------------------------------
+  For "observed" method GPUs (real data near t=60) where anchor_value > 1.0
+  (the GPU is currently above MSRP), the canonical curve is scaled to the
+  anchor value and all interpolated t < t_anchor values are capped at 1.0.
+  This allows AUDC computation for all GPUs instead of leaving appreciating
+  GPUs with NaN curves.
+
+
+================================================================================
+  5. UNCERTAINTY QUANTIFICATION (MONTE CARLO)
+================================================================================
+
+  5.1 Covariance Matrix from curve_fit
+  --------------------------------------
+  curve_fit returns the estimated parameter covariance matrix:
+
+      Sigma_theta = sigma^2 * (J^T J)^{-1}
+
+  where J is the Jacobian at theta* and sigma^2 is estimated from the
+  weighted residuals. Off-diagonal entries capture parameter co-variation
+  (particularly the floor–k negative correlation in exp_floor).
+
+  Regularisation: cov_reg = cov + eps * I  where eps = 1e-6 * trace(|cov|).
+  If condition(cov_reg) > 1e10 (near-singular), the point estimate is used
+  rather than sampling, avoiding pathological draws.
+
+  5.1b Bartlett Serial Correlation Correction
+  --------------------------------------------
+  curve_fit assumes IID residuals, but monthly GPU prices exhibit AR(1)
+  serial correlation (typical rho ~ 0.3-0.7). This violates the IID
+  assumption and causes pcov to understate true parameter uncertainty.
+
+  After fitting, the lag-1 autocorrelation rho is estimated from the
+  weighted (proportional-error) residuals:
+
+      r_i  = (y_i - f(t_i; theta*)) / sigma_i
+      rho  = corr(r_1...r_{n-1},  r_2...r_n)
+      rho  = clip(rho, -0.95, 0.95)
+
+  When rho > 0 and n >= 4, the covariance matrix is inflated:
+
+      pcov_corrected = pcov * (1 + rho) / (1 - rho)
+
+  This is the standard Bartlett effective-sample-size adjustment for
+  AR(1) processes (Bartlett 1935). Under positive AR(1), the effective
+  sample size is approximately n_eff ~ n * (1 - rho) / (1 + rho), so
+  variance estimates from n nominal observations must be scaled by the
+  reciprocal factor (1 + rho) / (1 - rho) to reflect the reduced
+  information content.
+
+  The correction is applied in two places:
+    - fit_model: inflates the full 2-parameter pcov (floor, k) for
+      Tier 1 individual fits.
+    - fit_constrained_floor: inflates floor_var for the 1-parameter
+      Tier 2 constrained fits, so that Tier 2 uncertainty is consistent
+      with the Bartlett-corrected k_var from the segment canonical fit.
+
+  The clip to rho <= 0.95 prevents blow-up for near-unit-root series
+  (rho -> 1 would send the inflation factor toward infinity).
+
+  5.2 Monte Carlo Draws (10,000 samples)
+  ----------------------------------------
+  MC_SAMPLES = 10,000 (increased from 5,000 for smoother CI estimation).
+
+  For Tier 1 (ensemble):
+      theta^(b) ~ MVN(theta*, cov_reg),  clipped to parameter bounds
+
+  For Tier 2 (constrained):
+      [floor^(b), k^(b)] ~ BivariateNormal([floor_opt, k_can], cov_2x2)
+      clipped to [0.001, 0.80] and [0.005, 0.25] respectively.
+
+  For Tier 2/3 stochastic scaling: the scale factor that anchors the curve
+  to the current market price includes +/-20% noise (uniform) to reflect
+  uncertainty in the current observed price level. Scale clips are
+  [0.3, 2.5] (widened from [0.5, 2.0]).
+
+  All projected values are clipped to [0.0, 3.0] to prevent pathological
+  draws from dominating summary statistics.
+
+  5.3 Summary Statistics
+  -----------------------
+  From the 10,000 × 11 MC array (rows = draws, columns = CURVE_TIMES):
+    - point estimate:   median of the t=60 column
+    - CI: Highest Posterior Density (HPD) 95% interval at the t=60 column.
+      HPD is the shortest interval containing 95% of samples, preferred
+      over equal-tailed intervals for skewed posteriors (common near
+      parameter bounds). Follows Bank of England fan chart methodology.
+    - sigma_yr5:        std dev of the t=60 column
+    - p_below_10pct:    fraction of t=60 draws below 0.10
+    - p_below_10_8yr:   fraction of t=96 draws below 0.10
+    - p_below_10_10yr:  fraction of t=120 draws below 0.10
+
+  CURVE_TIMES is now [0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120],
+  extending projections to 10 years (120 months).
+
+  The output CSV includes per-time-point uncertainty columns at all 11
+  time points (t0 through t120):
+    - ci_lo_t0 … ci_lo_t120: HPD lower bound at each time point
+    - ci_hi_t0 … ci_hi_t120: HPD upper bound at each time point
+    - sigma_t0 … sigma_t120: std dev of MC draws at each time point
+  These allow downstream consumers to reconstruct the full uncertainty fan
+  across the entire depreciation trajectory, not just at the 5-year endpoint.
+
+  Curve values are marginal medians at each time point, with monotonicity
+  enforced: a GPU's price_ratio must be non-increasing across time. After
+  the t=60 overwrite (to ensure proj_yr5_ratio matches proj_t60), a
+  backward clamp walks from t=60 to t=0 raising any earlier value that
+  fell below the target.
+
+  Half-life for Tier 2/3 GPUs uses _half_life_from_curve() (linear
+  interpolation on the projected curve) instead of _half_life_exp()
+  (analytical formula). Half-life values below 1.0 month are treated as
+  NaN (boundary artifact, not real depreciation).
+
+
+================================================================================
+  6. RANKING METRICS
+================================================================================
+
+  6.1 Terminal Value Ratio (TVR)
+  --------------------------------
+      TVR_k = projected price_ratio at t = 60 months
+
+  Lower TVR = worse depreciation. GPUs are ranked ascending by TVR.
+
+  6.2 Percentage Loss
+      pct_loss_k = (1 - TVR_k) * 100
+
+  Note: pct_loss is a monotone transform of TVR and is excluded from the
+  composite score to avoid double-counting (OECD Handbook §4.3).
+
+  6.3 Absolute Dollar Loss
+      abs_loss_usd_k = (1 - TVR_k) * msrp_usd_k
+
+  6.4 Half-Life
+  Months until price_ratio = 0.5 (see formulae in §3.1, §3.2).
+  NaN for GPUs where floor >= 0.5 or for "observed" method GPUs.
+
+  6.5 Area Under Depreciation Curve (AUDC)
+  -----------------------------------------
+  Total value retained over the 5-year window, from the fitted curve columns
+  (proj_t0 … proj_t60), normalised by 60:
+
+      AUDC_k = trapz(proj_t0...proj_t60) / (t_last - t_first)
+
+  Normalised by actual integration range (not fixed 60) so GPUs with any
+  missing time-point values are not deflated relative to full-range GPUs.
+
+  Individual curve values are capped at 1.0 before integration: back-
+  extrapolated values above MSRP would inflate the area and make GPUs with
+  scaling artifacts look like better value holders. AUDC is therefore
+  capped at 1.0 for ranking purposes.
+
+  Uses fitted curve (not raw observed data) so all GPUs share a common t=0
+  baseline including pre-June-2024 Keepa extension.
+  Higher AUDC = better value retention over the lifecycle.
+
+  6.6 Composite Rank Score
+  --------------------------
+  Three metrics are each ranked ascending (rank 1 = worst). NaN handling:
+    - audc: na_option='keep' (NaN excluded from composite mean,
+      not penalised — structural NaN for appreciating or observed-method GPUs).
+    - tvr, abs_loss_usd: na_option='bottom'.
+
+      composite_score_k = mean( rank_tvr, rank_abs_loss_usd, rank_audc )
+
+      overall_rank = rank( composite_score, ascending=True, method='min' )
+
+  method='min' uses competition ranking: tied GPUs share the lower rank
+  number and the next rank is skipped.
+
+  half_life_months is EXCLUDED from the composite. GPUs with NaN half_life
+  (observed method, or slow depreciators where floor >= 0.5) would get a
+  mean of 2 ranks while others get a mean of 3, making scores non-
+  comparable. Half-life is retained as a display column only.
+
+  6.6a Reliability and Confidence Weight
+  ----------------------------------------
+  Each GPU receives a reliability rating:
+    HIGH:   Tier 1 AND conf_flag = HIGH
+    MEDIUM: Tier <= 2 AND conf_flag in {HIGH, MEDIUM}
+    LOW:    everything else
+
+  Special guard: MI210 with n_months < 12 or age_span < 18 is capped at
+  MEDIUM regardless of other criteria.
+
+  confidence_weight is a numeric proxy for data quality:
+    Tier 1 = 1.0,  Tier 2 = 0.7,  Tier 3 = 0.4
+  It is NOT used to weight the composite score (that would be opaque) but
+  is provided for downstream filtering and sorting.
+
+  6.7 Demand-Shock Scenario Summary
+  -----------------------------------
+  Demand-shock GPUs are included in the main ranking but also reported with
+  two TVR scenarios projected to t = 60 months from launch:
+
+    Scenario A (shock persists):
+        TVR_A = floor_proxy + (current_ratio - floor_proxy) * exp(-k_proxy * time_to_t60)
+
+    Scenario B (normalises to MSRP then decays):
+        TVR_B = floor_proxy + (1 - floor_proxy) * exp(-k_proxy * time_to_t60)
+
+  where k_proxy and floor_proxy are segment-specific values from
+  SEG_K_FALLBACK:
+    DATACENTER:  k=0.025, floor=0.02
+    CONSUMER:    k=0.020, floor=0.05
+    WORKSTATION: k=0.018, floor=0.03
+  with a default fallback of k=0.020 and floor=0.15 for GPUs whose
+  segment is not in the table.
+  time_to_t60 = max(0, 60 - current_age_months).
+
+
+================================================================================
+  7. STATIONARITY (ADF TEST)
+================================================================================
+
+  The ADF (Augmented Dickey-Fuller) test is run per GPU on the monthly
+  median price_ratio series (>= 8 data points required). Non-stationarity
+  (ADF p > 0.05) is reported as a diagnostic warning. GPUs in demand-shock
+  periods are expected to be non-stationary by construction; the ADF test
+  is most informative for GPUs that appear to be depreciating smoothly.
+
+
+================================================================================
+  8. SUPPLEMENTARY DATA SOURCES
+================================================================================
+
+  8.1 eBay Completed/Sold Listings
+  ---------------------------------
+  scrape_ebay_sold.py targets 15 thin-data datacenter GPUs (H100, H200,
+  MI300X, Gaudi2, etc.). Each listing is filtered for accessories,
+  multi-GPU systems, and extreme prices (< 5% or > 300% MSRP), and scored
+  for confidence (HIGH/LOW). Output: data/ebay_verified_supplement.csv.
+  Loaded via data_prep.load_datacenter_supplement().
+
+  8.2 Cloud GPU Rental Pricing
+  -----------------------------
+  extract_cloud_pricing.py processes a historical cloud pricing database
+  (2015–2024) and produces monthly rental rate time series per GPU:
+
+      Output: data/cloud_pricing_monthly.csv
+      Columns: gpu_name, month, n_offers, median_dph, p25_dph, p75_dph
+
+  Cloud rental rate decline over time is an independent depreciation signal.
+
+  8.3 Vast.ai Rental Pricing
+  ----------------------------
+  scrape_vastai.py queries the Vast.ai public API for current GPU rental
+  rates. Hourly rates are converted to implied 3-year asset values:
+
+      implied_value = median_hourly × 8760 × 3 × 0.5
+
+  Output: data/vastai_pricing.csv.
+
+  8.4 TechPowerUp Specification Verification
+  --------------------------------------------
+  scrape_techpowerup.py cross-checks MSRP_REFERENCE and LAUNCH_DATES
+  constants against the TechPowerUp GPU database for 24 GPUs.
+
+
+================================================================================
+  9. MONTE CARLO VALIDATION
+================================================================================
+
+  9.1 Convergence Test (mc_convergence_test.py)
+  -----------------------------------------------
+  Compares 2,000 vs 10,000 MC samples on 5 representative GPUs (one per
+  fitting pathway). Measures coefficient of variation of CI percentiles
+  across 10 runs with different random seeds. Confirmed that 10,000
+  samples produce stable CI estimates (CV < 1% for all CI boundaries).
+
+  9.2 Log-Space Symmetry Test (test_mc_symmetry.py)
+  ---------------------------------------------------
+  Tests whether the MC posterior predictive is approximately symmetric in
+  log-space (justifying the normal approximation for uncertainty bands).
+  For each test GPU at each time point (t = 0, 12, 24, 36, 48, 60):
+    - Level-space skewness vs log-space skewness
+    - CI arm comparison in log-space (|log(median) - log(ci_lo)| vs
+      |log(ci_hi) - log(median)|)
+
+
+================================================================================
+  10. HIERARCHICAL BAYESIAN MODEL (hierarchical_bayes.py)
+================================================================================
+
+  Supplementary validation using PyMC. The model places segment-level
+  hyperpriors on decay parameters and allows GPU-level partial pooling:
+
+      k_segment ~ HalfNormal(sigma_k)
+      floor_segment ~ Beta(alpha_floor, beta_floor)
+      k_gpu ~ Normal(k_segment, sigma_k_gpu)
+      floor_gpu ~ Normal(floor_segment, sigma_floor_gpu)
+      price_ratio ~ Normal(exp_floor(t; floor_gpu, k_gpu), sigma_obs)
+
+  MCMC configuration: 2,000 draws, 1,000 tune, 2 chains, target_accept=0.9.
+
+  Key results:
+    - 0.948 Pearson correlation with scipy pipeline TVR estimates
+    - Better estimates for sparse-data GPUs (MI300X, GH200) via partial
+      pooling vs Tier 3 segment defaults
+    - Output: outputs/hierarchical_bayes_results.csv
+
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

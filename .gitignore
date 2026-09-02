@@ -1,0 +1,26 @@
+# Graphs / images
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# Data
+*.csv
+
+# Generated files
+*.pptx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/settings.local.json
